@@ -25,7 +25,7 @@
 #define NCCL_NET_SIGNAL_OP_ADD 0x2
 
 // Maximum number of requests per comm object
-#define NCCL_NET_MAX_REQUESTS 8
+#define NCCL_NET_MAX_REQUESTS 32
 
 typedef pcclNetProperties_v6_t ncclNetProperties_v6_t;
 typedef pcclNetProperties_v4_t ncclNetProperties_v4_t;

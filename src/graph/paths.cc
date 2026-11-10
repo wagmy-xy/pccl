@@ -347,6 +347,43 @@ ncclResult_t ncclGetUserP2pLevel(int* level) {
   return ncclSuccess;
 }
 
+NCCL_PARAM(NetDisableIntra, "NET_DISABLE_INTRA", -2);
+
+// Check whether going through the network would be faster than P2P/SHM.
+ncclResult_t ncclTopoCheckNet(struct ncclTopoSystem* system, int rank1, int rank2, int* net) {
+  if (ncclParamNetDisableIntra() == 1) {
+    *net = 0;
+    return ncclSuccess;
+  }
+  *net = 1;
+  int g1, g2;
+  if (ncclTopoRankToIndex(system, rank1, &g1) != ncclSuccess ||
+      ncclTopoRankToIndex(system, rank2, &g2) != ncclSuccess) return ncclSuccess;
+
+  struct ncclTopoNode* gpu1 = system->nodes[GPU].nodes+g1;
+  struct ncclTopoNode* gpu2 = system->nodes[GPU].nodes+g2;
+  float speed = gpu1->paths[GPU][g2].width;
+  float netSpeed1 = 0, netSpeed2 = 0;
+  bool hasAffinity1 = NCCL_TOPO_ID_LOCAL_ID(gpu1->gpu.netAffinity) != NCCL_TOPO_ID_LOCAL_ID_MASK;
+  bool hasAffinity2 = NCCL_TOPO_ID_LOCAL_ID(gpu2->gpu.netAffinity) != NCCL_TOPO_ID_LOCAL_ID_MASK;
+  for (int n=0; n<system->nodes[NET].count; n++) {
+    // Match ncclTopoGetLocalNet: a bound NIC overrides the fastest available NIC.
+    int64_t netId = system->nodes[NET].nodes[n].id;
+    // PCCL only allocates a path array when the corresponding node is reachable.
+    if (gpu1->paths[NET] && (!hasAffinity1 || gpu1->gpu.netAffinity == netId)) {
+      struct ncclTopoLinkList* path = gpu1->paths[NET]+n;
+      if (path->type <= PATH_PXB && path->width > netSpeed1) netSpeed1 = path->width;
+    }
+    if (gpu2->paths[NET] && (!hasAffinity2 || gpu2->gpu.netAffinity == netId)) {
+      struct ncclTopoLinkList* path = gpu2->paths[NET]+n;
+      if (path->type <= PATH_PXB && path->width > netSpeed2) netSpeed2 = path->width;
+    }
+  }
+  if (netSpeed1 > speed && netSpeed2 > speed) return ncclSuccess;
+  *net = 0;
+  return ncclSuccess;
+}
+
 PCCL_PARAM(EnableIntermedRank, "ENABLE_INTERMED_RANK", 0);
 ncclResult_t ncclTopoCheckP2p(ncclComm_t comm, struct ncclTopoSystem* system, int rank1, int rank2,
                               int* p2p, int *read, int* intermediateRank) {
@@ -631,12 +668,18 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, ncclComm_t comm
     NCCLCHECK(ncclTopoSetPaths(system->nodes[CPU].nodes+c, system));
   }
 
-  struct ncclPeerInfo* peerInfos = comm->peerInfo;
   // Set direct paths from/to GPUs.
   for (int g=0; g<system->nodes[GPU].count; g++) {
-    // Compute paths to GPU g
     NCCLCHECK(ncclTopoSetPaths(system->nodes[GPU].nodes+g, system));
+  }
 
+  // Set direct paths from/to NICs before checking transport availability.
+  for (int n=0; n<system->nodes[NET].count; n++) {
+    NCCLCHECK(ncclTopoSetPaths(system->nodes[NET].nodes+n, system));
+  }
+
+  struct ncclPeerInfo* peerInfos = comm->peerInfo;
+  for (int g=0; g<system->nodes[GPU].count; g++) {
     // Update path when we don't want to / can't use GPU Direct P2P
     for (int p=0; p<system->nodes[GPU].count; p++) {
       int p2p;
@@ -662,17 +705,16 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, ncclComm_t comm
         int shm;
         NCCLCHECK(ncclTransports[TRANSPORT_SHM]->canConnect(&shm, comm, system, NULL, srcInfo, dstInfo));
         if (shm == 0) {
-          // Mark this peer as inaccessible. We'll trim it later.
-          system->nodes[GPU].nodes[p].paths[GPU][g].count = 0;
+          // Mark this peer as accessible through the network only.
+          system->nodes[GPU].nodes[p].paths[GPU][g].type = PATH_NET;
         }
       }
     }
   }
 
-  // Set direct paths from/to NICs.
+  // Update paths for NICs (PXN, GDR, ...).
   for (int n=0; n<system->nodes[NET].count; n++) {
     struct ncclTopoNode* netNode = system->nodes[NET].nodes+n;
-    NCCLCHECK(ncclTopoSetPaths(netNode, system));
 
     for (int g=0; g<system->nodes[GPU].count; g++) {
       // Check whether we can access the NIC through another NVLink-connected GPU (PXN)
@@ -738,7 +780,7 @@ ncclResult_t ncclTopoTrimSystem(struct ncclTopoSystem* system, ncclComm_t comm) 
     ids[g] = gpu->id;
     for (int p=0; p<g; p++) {
       struct ncclTopoLinkList* path = gpu->paths[GPU] + p;
-      if (path->count > 0) {
+      if (path->count > 0 && path->type < PATH_NET) {
         domains[g] = std::min(domains[g], domains[p]);
         pathLevel = std::max(pathLevel, path->type);
       }

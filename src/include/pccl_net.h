@@ -19,7 +19,7 @@
 #define PCCL_PTR_HGGC 0x2
 
 // Maximum number of requests per comm object
-#define PCCL_NET_MAX_REQUESTS 8
+#define PCCL_NET_MAX_REQUESTS 32
 
 typedef struct {
   char* name;     // Used mostly for logging.

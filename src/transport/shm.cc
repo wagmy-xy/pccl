@@ -42,6 +42,10 @@ ncclResult_t shmCanConnect(int* ret, ncclComm_t comm, struct ncclTopoSystem* top
 
   if (ncclParamShmDisable() == 1) return ncclSuccess;
 
+  int useNet = 0;
+  NCCLCHECK(ncclTopoCheckNet(topo, info1->rank, info2->rank, &useNet));
+  if (useNet) return ncclSuccess;
+
   // Same host?
   TRACE(NCCL_INIT|NCCL_SHM, "peer1 hostHash %lx peer2 hostHash %lx", info1->hostHash, info2->hostHash);
   if (info1->hostHash != info2->hostHash) return ncclSuccess;

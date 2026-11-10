@@ -18,7 +18,7 @@
 #define NCCL_PTR_HGGC 0x2
 
 // Maximum number of requests per comm object
-#define NCCL_NET_MAX_REQUESTS 8
+#define NCCL_NET_MAX_REQUESTS 32
 
 typedef struct {
   char* name;     // Used mostly for logging.

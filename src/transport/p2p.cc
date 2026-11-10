@@ -128,6 +128,15 @@ ncclResult_t p2pCanConnect(int* ret, ncclComm_t comm, struct ncclTopoSystem* top
   NCCLCHECK(ncclTopoCheckP2p(comm, topo, info1->rank, info2->rank, ret, NULL, &intermediateRank));
   if (*ret == 0) return ncclSuccess;
 
+  if (intermediateRank == -1) {
+    int useNet = 0;
+    NCCLCHECK(ncclTopoCheckNet(topo, info1->rank, info2->rank, &useNet));
+    if (useNet) {
+      *ret = 0;
+      return ncclSuccess;
+    }
+  }
+
   if (info1->hostHash != comm->peerInfo[comm->rank].hostHash ||
       info1->hostHash != info2->hostHash) {
     // If either peer is non-local then we are done.

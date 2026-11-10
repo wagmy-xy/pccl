@@ -70,6 +70,7 @@ extern const char* topoLinkTypeStr[];
 #define PATH_PHBH 7 // high priority PHB when graph search
 #define PATH_PHB 8
 #define PATH_SYS 9
+#define PATH_NET 10
 
 extern const char* topoPathTypeStr[];
 

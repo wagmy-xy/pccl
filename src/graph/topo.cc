@@ -26,7 +26,9 @@
 
 const char* topoNodeTypeStr[] = { "GPU", "PCI", "ICNS", "CPU", "NIC", "NET" };
 const char* topoLinkTypeStr[] = { "LOC", "ICN", "", "PCI", "", "", "", "", "", "SYS", "NET" };
-const char* topoPathTypeStr[] = { "LOC", "ICN", "ICR", "PIX", "PXB", "PXN", "PXR", "PHBH", "PHB", "SYS" };
+const char* topoPathTypeStr[] = {
+  "LOC", "ICN", "ICR", "PIX", "PXB", "PXN", "PXR", "PHBH", "PHB", "SYS", "NET"
+};
 
 #define PCI_LANES_X8  8
 #define PCI_LANES_X16 16
@@ -152,6 +154,7 @@ ncclResult_t ncclTopoRemoveNode(struct ncclTopoSystem* system, int type, int ind
   VERBOSE(NCCL_INIT, "Trim Node type == %s, bus == %x, i == %d", topoNodeTypeStr[type], delNode->id, index);
   for (int t=0; t<NCCL_TOPO_NODE_TYPES; t++) {
     NCCLCHECK(ncclFree(delNode->paths[t]));
+    NCCLCHECK(ncclFree(delNode->npaths[t]));
     for (int n=0; n<system->nodes[t].count; n++) {
       struct ncclTopoNode* node = system->nodes[t].nodes+n;
       if (node == delNode) continue;
