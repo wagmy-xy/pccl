@@ -29,6 +29,13 @@ union ibv_gid {
 	} global;
 };
 
+// Enhanced Connection Establishment parameters, as defined by libibverbs.
+struct ibv_ece {
+  uint32_t vendor_id;
+  uint32_t options;
+  uint32_t comp_mask;
+};
+
 #ifndef container_of
 /**
   * container_of - cast a member of a structure out to the containing structure
@@ -192,6 +199,10 @@ enum ibv_port_cap_flags {
 	IBV_PORT_IP_BASED_GIDS			= 1 << 26,
 };
 
+enum ibv_query_port_flags {
+	IBV_QPF_GRH_REQUIRED = 1 << 0,
+};
+
 struct ibv_port_attr {
 	enum ibv_port_state	state;
 	enum ibv_mtu		max_mtu;
@@ -213,7 +224,9 @@ struct ibv_port_attr {
 	uint8_t			active_speed;
 	uint8_t			phys_state;
 	uint8_t			link_layer;
-	uint8_t			reserved;
+	uint8_t			flags;
+	uint16_t		port_cap_flags2;
+	uint32_t		active_speed_ex;
 };
 
 enum ibv_event_type {
@@ -998,6 +1011,13 @@ enum verbs_context_mask {
 
 struct verbs_context {
 	/*  "grows up" - new fields go here */
+	int (*query_port)(struct ibv_context *context, uint8_t port_num,
+			  struct ibv_port_attr *port_attr, size_t port_attr_len);
+	int (*_reserved_ext[25])(void);
+	struct verbs_ex_private *priv;
+	int (*query_device_ex)(struct ibv_context *context,
+			       const struct ibv_query_device_ex_input *input,
+			       struct ibv_device_attr_ex *attr, size_t attr_size);
 	int (*_reserved_2) (void);
 	int (*destroy_flow) (struct ibv_flow *flow);
 	int (*_reserved_1) (void);
@@ -1059,6 +1079,8 @@ ncclResult_t wrap_ibv_query_device(struct ibv_context *context, struct ibv_devic
 ncclResult_t wrap_ibv_query_port(struct ibv_context *context, uint8_t port_num, struct ibv_port_attr *port_attr);
 ncclResult_t wrap_ibv_query_gid(struct ibv_context *context, uint8_t port_num, int index, union ibv_gid *gid);
 ncclResult_t wrap_ibv_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr, int attr_mask, struct ibv_qp_init_attr *init_attr);
+ncclResult_t wrap_ibv_query_ece(struct ibv_qp* qp, struct ibv_ece* ece, int* supported);
+ncclResult_t wrap_ibv_set_ece(struct ibv_qp* qp, struct ibv_ece* ece, int* supported);
 ncclResult_t wrap_ibv_alloc_pd(struct ibv_pd **ret, struct ibv_context *context);
 ncclResult_t wrap_ibv_dealloc_pd(struct ibv_pd *pd);
 ncclResult_t wrap_ibv_reg_mr(struct ibv_mr **ret, struct ibv_pd *pd, void *addr, size_t length, int access);

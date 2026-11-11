@@ -17,8 +17,12 @@ struct ncclIbQpInfo {
   uint32_t lid;
   uint8_t ib_port;
   uint32_t qpn[NCCL_IB_MAX_QPS];
+  struct ibv_ece ece[NCCL_IB_MAX_QPS];
+  int eceSupported[NCCL_IB_MAX_QPS];
   int nqps;
   int splitDataOnQps;
+  int tc;
+  int sl;
 
   // For RoCE
   uint64_t spn;
@@ -39,7 +43,8 @@ struct ncclIbQpInfo {
 
 ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* commDevBase, int access_flags,
                             int oooRq, struct ibv_qp** qp, void* qp_context);
-ncclResult_t ncclIbRtrQp(ibv_qp* qp, uint32_t qpn, struct ncclIbQpInfo* info, int gidIndex, int maxDestRdAtomic = 1);
+ncclResult_t ncclIbRtrQp(ibv_qp* qp, uint32_t qpn, struct ncclIbQpInfo* info, int localDev,
+                         int tc, int sl, int maxDestRdAtomic = 1);
 ncclResult_t ncclIbRtsQp(ibv_qp* qp, int maxRdAtomic = 1);
 ncclResult_t ncclIbAbortConnect(void* opaqueHandle);
 

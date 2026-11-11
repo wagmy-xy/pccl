@@ -28,6 +28,8 @@ int (*ibv_internal_query_device)(struct ibv_context *context, struct ibv_device_
 int (*ibv_internal_query_port)(struct ibv_context *context, uint8_t port_num, struct ibv_port_attr *port_attr);
 int (*ibv_internal_query_gid)(struct ibv_context *context, uint8_t port_num, int index, union ibv_gid *gid);
 int (*ibv_internal_query_qp)(struct ibv_qp *qp, struct ibv_qp_attr *attr, int attr_mask, struct ibv_qp_init_attr *init_attr);
+int (*ibv_internal_query_ece)(struct ibv_qp* qp, struct ibv_ece* ece);
+int (*ibv_internal_set_ece)(struct ibv_qp* qp, struct ibv_ece* ece);
 struct ibv_pd * (*ibv_internal_alloc_pd)(struct ibv_context *context);
 int (*ibv_internal_dealloc_pd)(struct ibv_pd *pd);
 struct ibv_mr * (*ibv_internal_reg_mr)(struct ibv_pd *pd, void *addr, size_t length, int access);
@@ -96,6 +98,9 @@ ncclResult_t wrap_ibv_symbols(void) {
   LOAD_SYM(ibvhandle, "ibv_query_port", ibv_internal_query_port);
   LOAD_SYM(ibvhandle, "ibv_query_gid", ibv_internal_query_gid);
   LOAD_SYM(ibvhandle, "ibv_query_qp", ibv_internal_query_qp);
+  // ECE was added in IBVERBS_1.10; older libraries can use the normal path.
+  ibv_internal_query_ece = (int (*)(struct ibv_qp*, struct ibv_ece*)) dlsym(ibvhandle, "ibv_query_ece");
+  ibv_internal_set_ece = (int (*)(struct ibv_qp*, struct ibv_ece*)) dlsym(ibvhandle, "ibv_set_ece");
   LOAD_SYM(ibvhandle, "ibv_alloc_pd", ibv_internal_alloc_pd);
   LOAD_SYM(ibvhandle, "ibv_dealloc_pd", ibv_internal_dealloc_pd);
   LOAD_SYM(ibvhandle, "ibv_reg_mr", ibv_internal_reg_mr);
@@ -133,6 +138,8 @@ teardown:
   ibv_internal_query_port = NULL;
   ibv_internal_query_gid = NULL;
   ibv_internal_query_qp = NULL;
+  ibv_internal_query_ece = NULL;
+  ibv_internal_set_ece = NULL;
   ibv_internal_alloc_pd = NULL;
   ibv_internal_dealloc_pd = NULL;
   ibv_internal_reg_mr = NULL;
@@ -253,7 +260,31 @@ ncclResult_t wrap_ibv_query_device(struct ibv_context *context, struct ibv_devic
 }
 
 ncclResult_t wrap_ibv_query_port(struct ibv_context *context, uint8_t port_num, struct ibv_port_attr *port_attr) { /*returns 0 on success, or the value of errno on failure (which indicates the failure reason)*/
-  IBV_INT_CHECK_RET_ERRNO(ibv_internal_query_port, ibv_internal_query_port(context, port_num, port_attr), 0, "ibv_query_port");
+  // Newer libibverbs providers expose an extended query operation before the
+  // public context. Check both the ABI marker and size before accessing it.
+  memset(port_attr, 0, sizeof(*port_attr));
+  if (context != NULL && (uintptr_t)context->abi_compat == UINTPTR_MAX) {
+    struct verbs_context* vctx = container_of(context, struct verbs_context, context);
+    if (vctx->sz >= sizeof(*vctx) - offsetof(struct verbs_context, query_port) && vctx->query_port != NULL &&
+        vctx->query_port(context, port_num, port_attr, sizeof(*port_attr)) == 0) {
+      return ncclSuccess;
+    }
+  }
+
+  // The legacy ABI does not report flags. Clear the former reserved byte even
+  // if the old provider wrote to it, so it is never mistaken for GRH_REQUIRED.
+  memset(port_attr, 0, sizeof(*port_attr));
+  if (ibv_internal_query_port == NULL) {
+    ERROR("lib wrapper not initialized: ibv_query_port");
+    return ncclInternalError;
+  }
+  int ret = ibv_internal_query_port(context, port_num, port_attr);
+  if (ret != 0) {
+    WARN("Call to ibv_query_port failed: %s", strerror(ret));
+    return ncclSystemError;
+  }
+  port_attr->flags = 0;
+  return ncclSuccess;
 }
 
 ncclResult_t wrap_ibv_query_gid(struct ibv_context *context, uint8_t port_num, int index, union ibv_gid *gid) {
@@ -262,6 +293,39 @@ ncclResult_t wrap_ibv_query_gid(struct ibv_context *context, uint8_t port_num, i
 
 ncclResult_t wrap_ibv_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr, int attr_mask, struct ibv_qp_init_attr *init_attr) {
   IBV_INT_CHECK_RET_ERRNO(ibv_internal_query_qp, ibv_internal_query_qp(qp, attr, attr_mask, init_attr), 0, "ibv_query_qp");
+}
+
+static ncclResult_t ncclIbEceResult(int result, const char* name, int* supported) {
+  if (result == ENOTSUP || result == EOPNOTSUPP) {
+    INFO(NCCL_NET, "Call to %s not supported", name);
+    *supported = 0;
+    return ncclSuccess;
+  }
+  if (result != 0) {
+    WARN("NET/IB: %s failed: %s", name, strerror(result));
+    *supported = 1;
+    return ncclSystemError;
+  }
+  *supported = 1;
+  return ncclSuccess;
+}
+
+ncclResult_t wrap_ibv_query_ece(struct ibv_qp* qp, struct ibv_ece* ece, int* supported) {
+  if (ibv_internal_query_ece == NULL) {
+    INFO(NCCL_NET, "Call to ibv_query_ece skipped, symbol doesn't exist");
+    *supported = 0;
+    return ncclSuccess;
+  }
+  return ncclIbEceResult(ibv_internal_query_ece(qp, ece), "ibv_query_ece", supported);
+}
+
+ncclResult_t wrap_ibv_set_ece(struct ibv_qp* qp, struct ibv_ece* ece, int* supported) {
+  if (ibv_internal_set_ece == NULL) {
+    INFO(NCCL_NET, "Call to ibv_set_ece skipped, symbol doesn't exist");
+    *supported = 0;
+    return ncclSuccess;
+  }
+  return ncclIbEceResult(ibv_internal_set_ece(qp, ece), "ibv_set_ece", supported);
 }
 
 ncclResult_t wrap_ibv_alloc_pd(struct ibv_pd **ret, struct ibv_context *context) {

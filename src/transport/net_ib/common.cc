@@ -24,6 +24,37 @@ const char* ncclIbReqTypeStr[] = {
 NCCL_PARAM(IbSplitDataOnQps, "IB_SPLIT_DATA_ON_QPS", 0);
 NCCL_PARAM(IbAsyncEvents,"IB_RETURN_ASYNC_EVENTS",1);
 
+extern int64_t ncclParamIbTc();
+extern int64_t ncclParamIbSl();
+extern int64_t ncclParamIbFifoTc();
+
+ncclResult_t ncclIbValidateQosParams() {
+  const int64_t tc = ncclParamIbTc();
+  const int64_t sl = ncclParamIbSl();
+  const int64_t fifoTc = ncclParamIbFifoTc();
+  if (tc < -1 || tc > 255) {
+    WARN("NET/IB: IB_TC must be -1 or between 0 and 255, got %lld", (long long)tc);
+    return ncclInvalidArgument;
+  }
+  if (sl < -1 || sl > 15) {
+    WARN("NET/IB: IB_SL must be -1 or between 0 and 15, got %lld", (long long)sl);
+    return ncclInvalidArgument;
+  }
+  if (fifoTc < -1 || fifoTc > 255) {
+    WARN("NET/IB: IB_FIFO_TC must be -1 or between 0 and 255, got %lld", (long long)fifoTc);
+    return ncclInvalidArgument;
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t ncclIbValidateQosServiceLevel(int serviceLevel, int linkLayer) {
+  if (linkLayer == IBV_LINK_LAYER_INFINIBAND && (serviceLevel < 0 || serviceLevel > 15)) {
+    WARN("NET/IB: Effective service level %d must be between 0 and 15 for InfiniBand", serviceLevel);
+    return ncclInvalidArgument;
+  }
+  return ncclSuccess;
+}
+
 ncclResult_t ncclIbStatsCheckFatalCount(struct ncclIbStats* stat, const char* funcName) {
   if (ncclParamIbAsyncEvents() && __atomic_load_n(&stat->fatalErrorCount, std::memory_order_relaxed)) {
     ERROR("communicator encountered a fatal error (detected in %s)", funcName);

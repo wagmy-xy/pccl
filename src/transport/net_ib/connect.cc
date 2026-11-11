@@ -10,14 +10,16 @@
 #include "common.h"
 
 NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", -2);
+NCCL_PARAM(IbRoutableFlidGidIndex, "IB_ROUTABLE_FLID_GID_INDEX", 1);
 NCCL_PARAM(IbRoceVersionNum, "IB_ROCE_VERSION_NUM", 2);
 PCCL_PARAM(IbAddrFamilyFallback, "IB_ADDR_FAMILY_FALLBACK", 1);
 NCCL_PARAM(IbTimeout, "IB_TIMEOUT", 20);
 NCCL_PARAM(IbRetryCnt, "IB_RETRY_CNT", 7);
 NCCL_PARAM(IbPkey, "IB_PKEY", 0);
 NCCL_PARAM(IbUseInline, "IB_USE_INLINE", 0);
-NCCL_PARAM(IbSl, "IB_SL", 0);
-NCCL_PARAM(IbTc, "IB_TC", 0);
+NCCL_PARAM(IbSl, "IB_SL", -1);
+NCCL_PARAM(IbTc, "IB_TC", -1);
+NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", -1);
 
 struct ncclIbHandle {
   union ncclSocketAddress connectAddr;
@@ -29,6 +31,7 @@ struct ncclIbHandle {
 };
 
 NCCL_PARAM(IbQpsPerConn, "IB_QPS_PER_CONNECTION", 2);
+NCCL_PARAM(IbEceEnable, "IB_ECE_ENABLE", 1);
 extern int64_t ncclParamIbOooRq();
 
 ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base, void* cq_context) {
@@ -247,9 +250,36 @@ static ncclResult_t ncclUpdateGidIndex(struct ibv_context* context, uint8_t port
   return ncclSuccess;
 }
 
-ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, int gidTblLen, int *gidIndex) {
+// The two bytes at offset four encode FLID; the final two prefix bytes
+// identify the IB subnet. Use byte access to avoid unaligned loads.
+static uint16_t ncclIbExtractFlid(const union ibv_gid* gid) {
+  return ((uint16_t)gid->raw[4] << 8) | gid->raw[5];
+}
+
+static uint16_t ncclIbExtractSubnet(const union ibv_gid* gid) {
+  return ((uint16_t)gid->raw[6] << 8) | gid->raw[7];
+}
+
+ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum,
+                                const struct ibv_port_attr* portAttr, int *gidIndex) {
   *gidIndex = ncclParamIbGidIndex();
   if (*gidIndex >= 0) {
+    return ncclSuccess;
+  }
+
+  // Preserve an explicit IB_GID_INDEX; otherwise prefer a routable IB GID.
+  int gidTblLen = portAttr->gid_tbl_len;
+  if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
+    int64_t routableGidIndex = ncclParamIbRoutableFlidGidIndex();
+    if (routableGidIndex >= 0 && routableGidIndex < gidTblLen) {
+      union ibv_gid gid;
+      NCCLCHECK(wrap_ibv_query_gid(context, portNum, (int)routableGidIndex, &gid));
+      if (ncclIbExtractFlid(&gid) != 0) {
+        *gidIndex = (int)routableGidIndex;
+        return ncclSuccess;
+      }
+    }
+    *gidIndex = 0;
     return ncclSuccess;
   }
 
@@ -402,7 +432,15 @@ static ncclResult_t ncclIbPrepostRecvWorkRequests(struct ncclIbRecvComm* comm) {
   return ncclSuccess;
 }
 
-ncclResult_t ncclIbRtrQp(ibv_qp* qp, uint32_t qpn, struct ncclIbQpInfo* info, int gidIndex, int maxDestRdAtomic) {
+ncclResult_t ncclIbRtrQp(ibv_qp* qp, uint32_t qpn, struct ncclIbQpInfo* info, int localDev,
+                         int tc, int sl, int maxDestRdAtomic) {
+  struct ncclIbDev* dev = ncclIbDevs + localDev;
+  int gidIndex = dev->gidIndex;
+  if (tc < 0 || tc > 255 || sl < 0 || sl > 255) {
+    WARN("NET/IB: Invalid traffic class %d or service level %d", tc, sl);
+    return ncclInvalidArgument;
+  }
+  NCCLCHECK(ncclIbValidateQosServiceLevel(sl, dev->link));
   struct ibv_qp_attr qpAttr;
   memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
   qpAttr.qp_state = IBV_QPS_RTR;
@@ -418,14 +456,33 @@ ncclResult_t ncclIbRtrQp(ibv_qp* qp, uint32_t qpn, struct ncclIbQpInfo* info, in
     qpAttr.ah_attr.grh.flow_label = 0;
     qpAttr.ah_attr.grh.sgid_index = gidIndex;
     qpAttr.ah_attr.grh.hop_limit = 255;
-    qpAttr.ah_attr.grh.traffic_class = ncclParamIbTc();
+    qpAttr.ah_attr.grh.traffic_class = tc;
   } else {
+    union ibv_gid localGid, remoteGid;
+    NCCLCHECK(wrap_ibv_query_gid(dev->context, dev->port, gidIndex, &localGid));
+    remoteGid.global.subnet_prefix = info->spn;
+    remoteGid.global.interface_id = info->iid;
     qpAttr.ah_attr.is_global = 0;
     qpAttr.ah_attr.dlid = info->lid;
+    bool sameSubnet = ncclIbExtractSubnet(&localGid) == ncclIbExtractSubnet(&remoteGid);
+    if (!sameSubnet) {
+      uint16_t flid = ncclIbExtractFlid(&remoteGid);
+      if (flid == 0) {
+        WARN("NET/IB: Remote FLID is zero across IB subnets; using LID %u", info->lid);
+      } else {
+        qpAttr.ah_attr.dlid = flid;
+      }
+    }
+    if (!sameSubnet || (dev->portFlags & IBV_QPF_GRH_REQUIRED)) {
+      qpAttr.ah_attr.is_global = 1;
+      qpAttr.ah_attr.grh.dgid = remoteGid;
+      qpAttr.ah_attr.grh.sgid_index = gidIndex;
+      qpAttr.ah_attr.grh.hop_limit = 255;
+    }
   }
-  qpAttr.ah_attr.sl = ncclParamIbSl();
+  qpAttr.ah_attr.sl = sl;
   qpAttr.ah_attr.src_path_bits = 0;
-  qpAttr.ah_attr.port_num = info->ib_port;
+  qpAttr.ah_attr.port_num = dev->port;
   NCCLCHECK(wrap_ibv_modify_qp(qp, &qpAttr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER));
   return ncclSuccess;
 }
@@ -479,6 +536,10 @@ int ncclIbGidIndexFromDevice(int netDev) {
 }
 
 ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm) {
+  return ncclIbConnectWithTrafficClass(dev, opaqueHandle, NCCL_NET_TRAFFIC_CLASS_UNDEF, sendComm);
+}
+
+ncclResult_t ncclIbConnectWithTrafficClass(int dev, void* opaqueHandle, int trafficClass, void** sendComm) {
   ncclResult_t res = ncclSuccess;
   struct ncclIbHandle* handle = (struct ncclIbHandle*) opaqueHandle;
   struct ncclIbCommStage* stage = &handle->stage;
@@ -487,6 +548,13 @@ ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm) {
   *sendComm = NULL;
   ibv_context* ctx = NULL;
   uint8_t ib_port;
+
+  NCCLCHECKGOTO(ncclIbValidateQosParams(), res, fail);
+  if (trafficClass < NCCL_NET_TRAFFIC_CLASS_UNDEF || trafficClass > 255) {
+    WARN("NET/IB: Invalid traffic class %d", trafficClass);
+    res = ncclInvalidArgument;
+    goto fail;
+  }
 
   if (stage->state == ncclIbCommStateConnect) goto ib_connect_check;
   if (stage->state == ncclIbCommStateSend) goto ib_send;
@@ -546,8 +614,18 @@ ib_connect_check:
   memset(&qpInfo, 0, sizeof(qpInfo));
   qpInfo.nqps = comm->base.nqps;
   qpInfo.splitDataOnQps = !!comm->base.splitDataOnQps;
+  qpInfo.tc = ncclParamIbTc() != -1 ? ncclParamIbTc() :
+              trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF ? trafficClass : 0;
+  qpInfo.sl = ncclParamIbSl() != -1 ? ncclParamIbSl() :
+              trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF ? trafficClass : 0;
+  NCCLCHECKGOTO(ncclIbValidateQosServiceLevel(qpInfo.sl, ncclIbDevs[dev].link), res, fail);
   qpInfo.ib_port = ib_port;
-  for (int q=0; q<comm->base.nqps; q++) qpInfo.qpn[q] = comm->base.qps[q]->qp_num;
+  for (int q=0; q<comm->base.nqps; q++) {
+    qpInfo.qpn[q] = comm->base.qps[q]->qp_num;
+    if (ncclParamIbEceEnable()) {
+      NCCLCHECKGOTO(wrap_ibv_query_ece(comm->base.qps[q], &qpInfo.ece[q], &qpInfo.eceSupported[q]), res, fail);
+    }
+  }
   qpInfo.mtu = portAttr.active_mtu;
 
   // Prepare my fifo
@@ -566,19 +644,17 @@ ib_connect_check:
                                 &comm->putSignalScratchpad, sizeof(comm->putSignalScratchpad),
                                 IBV_ACCESS_LOCAL_WRITE), res, fail);
 
-  // RoCE support
+  // Both IB and RoCE peers need the GID for global addressing.
+  union ibv_gid localGid;
+  NCCLCHECKGOTO(wrap_ibv_query_gid(ctx, ib_port, ncclIbGidIndexFromDevice(dev), &localGid), res, fail);
+  qpInfo.spn = localGid.global.subnet_prefix;
+  qpInfo.iid = localGid.global.interface_id;
   qpInfo.lid = portAttr.lid;
   if (qpInfo.lid) { // IB
-    qpInfo.spn = 0;
-    qpInfo.iid = 0;
     for (int q=0; q<comm->base.nqps; q++)
       INFO(NCCL_NET,"NET/IB: Dev %d Port %d qpn %d mtu %d LID %d", dev, ib_port, qpInfo.qpn[q], qpInfo.mtu, qpInfo.lid);
   } else { // RoCE
-    union ibv_gid gid;
-    int gidIndex  = ncclIbGidIndexFromDevice(dev);
-    NCCLCHECKGOTO(wrap_ibv_query_gid(ctx, ib_port, gidIndex, &gid), res, fail);
-    qpInfo.spn = gid.global.subnet_prefix;
-    qpInfo.iid = gid.global.interface_id;
+    int gidIndex = ncclIbGidIndexFromDevice(dev);
     for (int q=0; q<comm->base.nqps; q++)
       INFO(NCCL_NET,"NET/IB: Dev %d Port %d qpn %d mtu %d GID %ld (%lX/%lX)", dev, ib_port, qpInfo.qpn[q], qpInfo.mtu, gidIndex, qpInfo.spn, qpInfo.iid);
   }
@@ -612,7 +688,11 @@ ib_recv:
   comm->remSizesFifoRkey = remQpInfo.sizesFifoRkey;
   for (int q = 0; q < comm->base.nqps; q++) {
     struct ibv_qp* qp = comm->base.qps[q];
-    NCCLCHECKGOTO(ncclIbRtrQp(qp, remQpInfo.qpn[q], &remQpInfo, ncclIbGidIndexFromDevice(comm->netDev)), res, fail);
+    if (remQpInfo.eceSupported[q]) {
+      NCCLCHECKGOTO(wrap_ibv_set_ece(qp, &remQpInfo.ece[q], &remQpInfo.eceSupported[q]), res, fail);
+    }
+    NCCLCHECKGOTO(ncclIbRtrQp(qp, remQpInfo.qpn[q], &remQpInfo, comm->netDev,
+                               remQpInfo.tc, remQpInfo.sl), res, fail);
     NCCLCHECKGOTO(ncclIbRtsQp(qp), res, fail);
   }
 
@@ -675,9 +755,12 @@ ncclResult_t ncclIbAccept(void* listenComm, void** recvComm) {
   int ready;
   *recvComm = NULL;
   struct ncclIbQpInfo remQpInfo;
+  struct ncclIbQpInfo qpInfo;
   ibv_context* ctx = NULL;
   uint8_t ib_port;
   int gidIndex = ncclIbGidIndexFromDevice(lComm->dev);
+
+  NCCLCHECKGOTO(ncclIbValidateQosParams(), res, fail);
 
   if (stage->state == ncclIbCommStateAccept) goto ib_accept_check;
   if (stage->state == ncclIbCommStateRecv) goto ib_recv;
@@ -712,6 +795,7 @@ ib_recv:
 
   /* copy back the received info */
   memcpy(&remQpInfo, stage->buffer, sizeof(struct ncclIbQpInfo));
+  memset(&qpInfo, 0, sizeof(qpInfo));
   rComm->base.remOooRqSize = remQpInfo.oooRqSize;
   NCCLCHECKGOTO(ncclIbEnableOooRq(lComm->dev, rComm->base.remOooRqSize, &rComm->base.oooRq), res, fail);
   rComm->base.recvMatchingScheme = rComm->base.oooRq ? BY_ID : BY_INDEX;
@@ -758,8 +842,16 @@ ib_recv:
   // Setup QP
   for (int q=0; q<rComm->base.nqps; q++) {
     struct ibv_qp* qp = rComm->base.qps[q];
-    NCCLCHECKGOTO(ncclIbRtrQp(qp, remQpInfo.qpn[q], &remQpInfo, gidIndex), res, fail);
+    if (remQpInfo.eceSupported[q]) {
+      NCCLCHECKGOTO(wrap_ibv_set_ece(qp, &remQpInfo.ece[q], &qpInfo.eceSupported[q]), res, fail);
+    }
+    int fifoTc = remQpInfo.lid == 0 && ncclParamIbFifoTc() != -1 ? ncclParamIbFifoTc() : remQpInfo.tc;
+    NCCLCHECKGOTO(ncclIbRtrQp(qp, remQpInfo.qpn[q], &remQpInfo, lComm->dev,
+                               fifoTc, remQpInfo.sl), res, fail);
     NCCLCHECKGOTO(ncclIbRtsQp(qp), res, fail);
+    if (qpInfo.eceSupported[q]) {
+      NCCLCHECKGOTO(wrap_ibv_query_ece(qp, &qpInfo.ece[q], &qpInfo.eceSupported[q]), res, fail);
+    }
   }
   NCCLCHECKGOTO(ncclIbPrepostRecvWorkRequests(rComm), res, fail);
 
@@ -802,7 +894,8 @@ ib_recv:
     localQpInfo.spn=gid.global.subnet_prefix;
     localQpInfo.iid=gid.global.interface_id;
     localQpInfo.mtu=portAttr.active_mtu;
-    NCCLCHECKGOTO(ncclIbRtrQp(rComm->gpuFlush.qp, rComm->gpuFlush.qp->qp_num, &localQpInfo, gidIndex, flushReadDepth), res, fail);
+    NCCLCHECKGOTO(ncclIbRtrQp(rComm->gpuFlush.qp, rComm->gpuFlush.qp->qp_num, &localQpInfo, lComm->dev,
+                               remQpInfo.tc, remQpInfo.sl, flushReadDepth), res, fail);
     NCCLCHECKGOTO(ncclIbRtsQp(rComm->gpuFlush.qp, flushReadDepth), res, fail);
     if (!rComm->gpuFlush.useWrite) {
       VERBOSE(NCCL_NET, "NET/IB: GDR READ flush QP dev=%d qp=%u depth=%d",
@@ -817,10 +910,10 @@ ib_recv:
                                 sizeof(rComm->sizesFifo), IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE), res, fail);
 
   // Fill Handle
-  struct ncclIbQpInfo qpInfo;
-  memset(&qpInfo, 0, sizeof(qpInfo));
   qpInfo.nqps = rComm->base.nqps;
   qpInfo.splitDataOnQps = !!rComm->base.splitDataOnQps;
+  qpInfo.tc = remQpInfo.tc;
+  qpInfo.sl = remQpInfo.sl;
   qpInfo.lid=portAttr.lid;
   qpInfo.ib_port=ib_port;
   for (int q=0; q<rComm->base.nqps; q++) qpInfo.qpn[q]=rComm->base.qps[q]->qp_num;

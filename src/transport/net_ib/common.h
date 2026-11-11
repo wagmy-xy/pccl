@@ -61,6 +61,7 @@ struct ncclIbDev {
     int device;
     uint64_t guid;
     uint8_t port;
+    uint8_t portFlags;
     uint8_t link;
     int speed;
     ibv_context* context;
@@ -331,6 +332,8 @@ static void ncclIbDevFatalError(struct ncclIbDev* dev) {
   ncclIbStatsFatalError(&dev->stats);
 }
 ncclResult_t ncclIbStatsCheckFatalCount(struct ncclIbStats* stat, const char* funcName);
+ncclResult_t ncclIbValidateQosParams();
+ncclResult_t ncclIbValidateQosServiceLevel(int serviceLevel, int linkLayer);
 
 extern pthread_t ncclIbAsyncThread;
 void* ncclIbAsyncThreadMain(void* args);
@@ -346,7 +349,7 @@ ncclResult_t ncclIbSetTrafficClass(void* ctx, int trafficClass);
 ncclResult_t ncclIbGetPhysProperties(int dev, ncclNetProperties_t* props);
 ncclResult_t ncclIbRegMrDmaBufInternal(void* comm, void* data, size_t size, int type, uint64_t offset, int fd, uint64_t mrFlags, void** mhandle);
 
-ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, int gidTblLen, int *gidIndex);
+ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, const struct ibv_port_attr* portAttr, int *gidIndex);
 int ncclIbGidIndexFromDevice(int netDev);
 ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbRequest** req);
 ncclResult_t ncclIbFreeRequest(struct ncclIbRequest* r);
@@ -358,6 +361,7 @@ ncclResult_t ncclIbDevices(int* ndev);
 ncclResult_t ncclIbGetProperties(int dev, ncclNetProperties_t* props);
 ncclResult_t ncclIbListen(int dev, void* opaqueHandle, void** listenComm);
 ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm);
+ncclResult_t ncclIbConnectWithTrafficClass(int dev, void* opaqueHandle, int trafficClass, void** sendComm);
 ncclResult_t ncclIbAccept(void* listenComm, void** recvComm);
 ncclResult_t ncclIbRegMr(void* comm, void* data, int size, int type, void** mhandle);
 ncclResult_t ncclIbRegMrInternal(void* comm, void* data, size_t size, int type, uint64_t mrFlags,
