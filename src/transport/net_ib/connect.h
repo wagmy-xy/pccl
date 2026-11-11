@@ -17,6 +17,8 @@ struct ncclIbQpInfo {
   uint32_t lid;
   uint8_t ib_port;
   uint32_t qpn[NCCL_IB_MAX_QPS];
+  int nqps;
+  int splitDataOnQps;
 
   // For RoCE
   uint64_t spn;
@@ -26,6 +28,8 @@ struct ncclIbQpInfo {
   // FIFO RDMA info
   uint32_t fifoRkey;
   uint64_t fifoAddr;
+  uint32_t sizesFifoRkey;
+  uint64_t sizesFifoAddr;
 
   // OOO RQ capability used by the peer during data QP setup.
   // TODO: Remove this compatibility field after porting NCCL's per-device metadata
@@ -37,10 +41,6 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* commDe
                             int oooRq, struct ibv_qp** qp, void* qp_context);
 ncclResult_t ncclIbRtrQp(ibv_qp* qp, uint32_t qpn, struct ncclIbQpInfo* info, int gidIndex, int maxDestRdAtomic = 1);
 ncclResult_t ncclIbRtsQp(ibv_qp* qp, int maxRdAtomic = 1);
-
-// Phase-2 connection setup: complete sender/receiver QP transition.
-// Must be called after ncclIbConnect/ncclIbAccept before posting WRs directly.
-ncclResult_t ncclSendCheck(struct ncclIbSendComm* comm);
-ncclResult_t ncclRecvCheck(struct ncclIbRecvComm* comm);
+ncclResult_t ncclIbAbortConnect(void* opaqueHandle);
 
 #endif //NET_IB_CONNECT_H_

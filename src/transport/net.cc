@@ -94,6 +94,10 @@ struct connectMap {
 struct sendResources {
   struct connectMap map;
   void* netSendComm;
+  // IB keeps its asynchronous connect state in the handle. Keep it alive until
+  // proxy teardown even if the request buffer is discarded on abort.
+  alignas(uint64_t) ncclNetHandle_t ibConnectHandle;
+  bool ibConnectHandleInitialized;
   struct ncclSendMem* sendMem;
   struct ncclRecvMem* recvMem;
 
@@ -623,6 +627,13 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
 
   if (nccl_use_eic && nccl_eic_gpu_offset && proxyState->ownerComm->hgmlDeviceCount > 8)
     *(int *)((uintptr_t)reqBuff + nccl_eic_gpu_offset) = proxyState->ownerComm->hgmlDev + 1;
+  if (ncclNet == &ncclNetIb) {
+    if (!resources->ibConnectHandleInitialized) {
+      memcpy(resources->ibConnectHandle, reqBuff, sizeof(ncclNetHandle_t));
+      resources->ibConnectHandleInitialized = true;
+    }
+    reqBuff = resources->ibConnectHandle;
+  }
   if (resources->shared) {
     // Shared buffers
     struct ncclProxyProgressState* progressState = &proxyState->progressState;
@@ -850,6 +861,7 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
   }
   *done = 1;
   NCCLCHECK(ncclNetCloseListen(resources->netListenComm));
+  resources->netListenComm = NULL;
 
   // Create structures
   struct connectMap* map = &resources->map;
@@ -967,6 +979,8 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
 
 static ncclResult_t sendProxyFree(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState) {
   struct sendResources* resources = (struct sendResources*)(connection->transportResources);
+  if (resources && resources->ibConnectHandleInitialized)
+    NCCLCHECK(ncclIbAbortConnect(resources->ibConnectHandle));
   if (connection->state == connSharedInitialized) { // NVB Preconnect or unused p2p conn for coll
     NCCLCHECK(sharedBuffersDestroy(proxyState, connection->tpLocalRank, 0, connection));
     return ncclSuccess;
@@ -1017,6 +1031,10 @@ static ncclResult_t sendProxyFree(struct ncclProxyConnection* connection, struct
 
 static ncclResult_t recvProxyFree(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState) {
   struct recvResources* resources = (struct recvResources*)(connection->transportResources);
+  if (resources && resources->netListenComm && ncclNet == &ncclNetIb) {
+    NCCLCHECK(ncclNetCloseListen(resources->netListenComm));
+    resources->netListenComm = NULL;
+  }
   if (connection->state == connSharedInitialized) { // NVB Preconnect or unused p2p conn for coll
     NCCLCHECK(sharedBuffersDestroy(proxyState, connection->tpLocalRank, 1, connection));
     return ncclSuccess;

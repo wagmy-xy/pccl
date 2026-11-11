@@ -297,6 +297,7 @@ ncclResult_t ncclGinIbConnect(void* ctx, void* handles[], int nranks, int rank,
   return ncclSuccess;
 fail:
   if (cCommArray) {
+    if (cCommArray->sendComm == NULL) ncclIbAbortConnect(handles[next]);
     if (cCommArray->recvComm) ncclNetIb.closeRecv(cCommArray->recvComm);
     if (cCommArray->sendComm) ncclNetIb.closeSend(cCommArray->sendComm);
     free(cCommArray);
@@ -499,6 +500,7 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
   void* lComm = NULL;
   char* handle = NULL;
   char* handles = NULL;
+  void* pendingHandle = NULL;
   NCCLCHECKGOTO(ncclIbMalloc((void**)&handles, NCCL_NET_HANDLE_MAXSIZE * cComm->nranks), ret, end);
   handle = handles + NCCL_NET_HANDLE_MAXSIZE * cComm->rank;
 
@@ -515,28 +517,24 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
       int connectPeer = (cComm->rank + i) % nranks;
       int acceptPeer = (cComm->rank - i + nranks) % nranks;
       do {
-        if (gc->fullSendComm[connectPeer] == NULL)
+        if (gc->fullSendComm[connectPeer] == NULL) {
+          pendingHandle = handles + NCCL_NET_HANDLE_MAXSIZE * connectPeer;
           NCCLCHECKGOTO(ncclNetIb.connect(cComm->dev,
-                                          handles + NCCL_NET_HANDLE_MAXSIZE * connectPeer,
-                                          &gc->fullSendComm[connectPeer]),
+                                          pendingHandle, &gc->fullSendComm[connectPeer]),
                         ret, end);
+          if (gc->fullSendComm[connectPeer]) pendingHandle = NULL;
+        }
         if (gc->fullRecvComm[acceptPeer] == NULL)
           NCCLCHECKGOTO(ncclNetIb.accept(lComm, &gc->fullRecvComm[acceptPeer]),
                         ret, end);
       } while ((gc->fullSendComm[connectPeer] == NULL) ||
                (gc->fullRecvComm[acceptPeer] == NULL));
-      // Phase-2: complete QP transition (INIT → RTR → RTS) on the sender
-      // side and synchronize with the receiver.  Without this the sender's
-      // QP stays in INIT and ibv_post_send in IPut/IGet will fail.
-      while (((struct ncclIbSendComm*)gc->fullSendComm[connectPeer])->base.ready == 0)
-        NCCLCHECKGOTO(ncclSendCheck((struct ncclIbSendComm*)gc->fullSendComm[connectPeer]), ret, end);
-      while (((struct ncclIbRecvComm*)gc->fullRecvComm[acceptPeer])->base.ready == 0)
-        NCCLCHECKGOTO(ncclRecvCheck((struct ncclIbRecvComm*)gc->fullRecvComm[acceptPeer]), ret, end);
       NCCLCHECKGOTO(ncclGinIbP2PBarrier(cComm), ret, end);
     }
   }
 
 end:
+  if (pendingHandle) ncclIbAbortConnect(pendingHandle);
   free(handles);
   if (lComm) ncclNetIb.closeListen(lComm);
   if (ret != ncclSuccess) {
