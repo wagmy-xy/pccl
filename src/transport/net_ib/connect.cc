@@ -36,9 +36,10 @@ ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base
   ncclIbDev* ibDev = ncclIbDevs + ibDevN;
   {
     std::lock_guard<std::mutex> lock(ibDev->mutex);
-    if (0 == ibDev->pdRefs++) {
+    if (ibDev->pdRefs == 0) {
       NCCLCHECK(wrap_ibv_alloc_pd(&ibDev->pd, ibDev->context));
     }
+    ibDev->pdRefs++;
     base->pd = ibDev->pd;
   }
   // Recv requests can generate 2 completions (one for the post FIFO, one for the Recv).
@@ -489,6 +490,8 @@ ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm) {
 
   if (stage->state == ncclIbCommStateConnect) goto ib_connect_check;
   if (stage->state == ncclIbCommStateSend) goto ib_send;
+  if (stage->state == ncclIbCommStateConnecting) goto ib_recv;
+  if (stage->state == ncclIbCommStateConnected) goto ib_send_ready;
   if (stage->state != ncclIbCommStateStart) {
     ERROR("Error: trying to connect already connected sendComm");
     return ncclInternalError;
@@ -502,16 +505,23 @@ ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm) {
   stage->comm = comm;
   stage->state = ncclIbCommStateConnect;
 
-  NCCLCHECK(ncclSocketConnect(&comm->base.sock));
+  NCCLCHECKGOTO(ncclSocketConnect(&comm->base.sock), res, fail);
 
 ib_connect_check:
-  NCCLCHECK(ncclSocketReady(&comm->base.sock, &ready));
+  NCCLCHECKGOTO(ncclSocketReady(&comm->base.sock, &ready), res, fail);
   if (!ready) return ncclSuccess;
 
   NCCLCHECKGOTO(ncclIbMalloc((void**)&stage->buffer, sizeof(struct ncclIbQpInfo)), res, fail);
   comm->base.remOooRqSize = handle->oooRqSize;
   NCCLCHECKGOTO(ncclIbEnableOooRq(dev, comm->base.remOooRqSize, &comm->base.oooRq), res, fail);
   comm->base.recvMatchingScheme = comm->base.oooRq ? BY_ID : BY_INDEX;
+
+  // Validate before allocating QPs or using the count to size the CQ.
+  if (ncclParamIbQpsPerConn() < 1 || ncclParamIbQpsPerConn() > NCCL_IB_MAX_QPS) {
+    WARN("NET/IB: IB_QPS_PER_CONNECTION must be between 1 and %d", NCCL_IB_MAX_QPS);
+    res = ncclInvalidArgument;
+    goto fail;
+  }
 
   // IB Setup
   ctx = ncclIbDevs[dev].context;
@@ -533,6 +543,9 @@ ib_connect_check:
   struct ibv_port_attr portAttr;
   NCCLCHECKGOTO(wrap_ibv_query_port(ctx, ib_port, &portAttr), res, fail);
   struct ncclIbQpInfo qpInfo;
+  memset(&qpInfo, 0, sizeof(qpInfo));
+  qpInfo.nqps = comm->base.nqps;
+  qpInfo.splitDataOnQps = !!comm->base.splitDataOnQps;
   qpInfo.ib_port = ib_port;
   for (int q=0; q<comm->base.nqps; q++) qpInfo.qpn[q] = comm->base.qps[q]->qp_num;
   qpInfo.mtu = portAttr.active_mtu;
@@ -542,6 +555,8 @@ ib_connect_check:
                                 IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_REMOTE_READ), res, fail);
   qpInfo.fifoRkey = comm->fifoMr->rkey;
   qpInfo.fifoAddr = (uint64_t)comm->ctsFifo;
+  NCCLCHECKGOTO(wrap_ibv_reg_mr(&comm->sizesFifoMr, comm->dev.base.pd, comm->sizesFifo,
+                                sizeof(comm->sizesFifo), IBV_ACCESS_LOCAL_WRITE), res, fail);
   qpInfo.oooRqSize = ncclIbGetOooRqSize(dev);
 
   // Register a small scratchpad MR that the GIN proxy iputSignal path uses as
@@ -573,11 +588,42 @@ ib_connect_check:
   memcpy(stage->buffer, &qpInfo, sizeof(qpInfo));
 
 ib_send:
-  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, stage->buffer, sizeof(qpInfo), &stage->offset));
+  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, stage->buffer, sizeof(qpInfo),
+                                   &stage->offset), res, fail);
   if (stage->offset != sizeof(qpInfo))
     return ncclSuccess;
 
+  stage->state = ncclIbCommStateConnecting;
+  stage->offset = 0;
+ib_recv:
+  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->base.sock, stage->buffer, sizeof(qpInfo),
+                                   &stage->offset), res, fail);
+  if (stage->offset != sizeof(qpInfo)) return ncclSuccess;
+
+  struct ncclIbQpInfo remQpInfo;
+  memcpy(&remQpInfo, stage->buffer, sizeof(remQpInfo));
+  if (remQpInfo.nqps != comm->base.nqps ||
+      remQpInfo.splitDataOnQps != !!comm->base.splitDataOnQps) {
+    WARN("NET/IB: Peer QP count or data splitting configuration does not match");
+    res = ncclRemoteError;
+    goto fail;
+  }
+  comm->remSizesFifoAddr = remQpInfo.sizesFifoAddr;
+  comm->remSizesFifoRkey = remQpInfo.sizesFifoRkey;
+  for (int q = 0; q < comm->base.nqps; q++) {
+    struct ibv_qp* qp = comm->base.qps[q];
+    NCCLCHECKGOTO(ncclIbRtrQp(qp, remQpInfo.qpn[q], &remQpInfo, ncclIbGidIndexFromDevice(comm->netDev)), res, fail);
+    NCCLCHECKGOTO(ncclIbRtsQp(qp), res, fail);
+  }
+
+  comm->base.ready = 1;
   stage->state = ncclIbCommStateConnected;
+  stage->offset = 0;
+ib_send_ready:
+  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, &comm->base.ready, sizeof(int),
+                                   &stage->offset), res, fail);
+  if (stage->offset != sizeof(int)) return ncclSuccess;
+
   *sendComm = comm;
 exit:
   NCCLCHECK(ncclFree(stage->buffer));
@@ -593,6 +639,16 @@ fail:
     comm = NULL;
   }
   goto exit;
+}
+
+ncclResult_t ncclIbAbortConnect(void* opaqueHandle) {
+  struct ncclIbCommStage* stage = &((struct ncclIbHandle*)opaqueHandle)->stage;
+  if (stage->comm) NCCLCHECK(ncclIbCloseSend(stage->comm));
+  NCCLCHECK(ncclFree(stage->buffer));
+  stage->comm = NULL;
+  stage->state = ncclIbCommStateStart;
+  stage->offset = 0;
+  return ncclSuccess;
 }
 
 NCCL_PARAM(IbGdrFlushDisable, "GDR_FLUSH_DISABLE", 0);
@@ -626,6 +682,7 @@ ncclResult_t ncclIbAccept(void* listenComm, void** recvComm) {
   if (stage->state == ncclIbCommStateAccept) goto ib_accept_check;
   if (stage->state == ncclIbCommStateRecv) goto ib_recv;
   if (stage->state == ncclIbCommStateSend) goto ib_send;
+  if (stage->state == ncclIbCommStatePendingReady) goto ib_recv_ready;
   if (stage->state != ncclIbCommStateStart) {
     ERROR("Listencomm in unknown state %d\n", stage->state);
     return ncclInternalError;
@@ -636,11 +693,11 @@ ncclResult_t ncclIbAccept(void* listenComm, void** recvComm) {
   NCCLCHECKGOTO(ncclIbStatsInit(&rComm->base.stats), res, fail);
   stage->comm = rComm;
   stage->state = ncclIbCommStateAccept;
-  NCCLCHECK(ncclSocketInit(&rComm->base.sock));
+  NCCLCHECKGOTO(ncclSocketInit(&rComm->base.sock), res, fail);
 
-  NCCLCHECK(ncclSocketAccept(&rComm->base.sock, &lComm->sock));
+  NCCLCHECKGOTO(ncclSocketAccept(&rComm->base.sock, &lComm->sock), res, fail);
 ib_accept_check:
-  NCCLCHECK(ncclSocketReady(&rComm->base.sock, &ready));
+  NCCLCHECKGOTO(ncclSocketReady(&rComm->base.sock, &ready), res, fail);
   if (!ready) return ncclSuccess;
 
   NCCLCHECKGOTO(ncclIbMalloc((void**)&stage->buffer, sizeof(remQpInfo)), res, fail);
@@ -648,7 +705,8 @@ ib_accept_check:
   stage->offset = 0;
 
 ib_recv:
-  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &rComm->base.sock, stage->buffer, sizeof(remQpInfo), &stage->offset));
+  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_RECV, &rComm->base.sock, stage->buffer, sizeof(remQpInfo),
+                                   &stage->offset), res, fail);
   if (stage->offset != sizeof(remQpInfo))
     return ncclSuccess;
 
@@ -657,6 +715,18 @@ ib_recv:
   rComm->base.remOooRqSize = remQpInfo.oooRqSize;
   NCCLCHECKGOTO(ncclIbEnableOooRq(lComm->dev, rComm->base.remOooRqSize, &rComm->base.oooRq), res, fail);
   rComm->base.recvMatchingScheme = rComm->base.oooRq ? BY_ID : BY_INDEX;
+
+  if (ncclParamIbQpsPerConn() < 1 || ncclParamIbQpsPerConn() > NCCL_IB_MAX_QPS) {
+    WARN("NET/IB: IB_QPS_PER_CONNECTION must be between 1 and %d", NCCL_IB_MAX_QPS);
+    res = ncclInvalidArgument;
+    goto fail;
+  }
+  if (remQpInfo.nqps != ncclParamIbQpsPerConn() ||
+      remQpInfo.splitDataOnQps != !!rComm->base.splitDataOnQps) {
+    WARN("NET/IB: Peer QP count or data splitting configuration does not match");
+    res = ncclRemoteError;
+    goto fail;
+  }
 
   // IB setup
   ctx = ncclIbDevs[lComm->dev].context;
@@ -743,8 +813,14 @@ ib_recv:
     }
   }
 
+  NCCLCHECKGOTO(wrap_ibv_reg_mr(&rComm->sizesFifoMr, rComm->dev.base.pd, rComm->sizesFifo,
+                                sizeof(rComm->sizesFifo), IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE), res, fail);
+
   // Fill Handle
   struct ncclIbQpInfo qpInfo;
+  memset(&qpInfo, 0, sizeof(qpInfo));
+  qpInfo.nqps = rComm->base.nqps;
+  qpInfo.splitDataOnQps = !!rComm->base.splitDataOnQps;
   qpInfo.lid=portAttr.lid;
   qpInfo.ib_port=ib_port;
   for (int q=0; q<rComm->base.nqps; q++) qpInfo.qpn[q]=rComm->base.qps[q]->qp_num;
@@ -752,6 +828,8 @@ ib_recv:
   qpInfo.iid=gid.global.interface_id;
   qpInfo.mtu=remQpInfo.mtu;
   qpInfo.oooRqSize = ncclIbGetOooRqSize(lComm->dev);
+  qpInfo.sizesFifoAddr = (uint64_t)rComm->sizesFifo;
+  qpInfo.sizesFifoRkey = rComm->sizesFifoMr->rkey;
 
   stage->state = ncclIbCommStateSend;
   stage->offset = 0;
@@ -759,8 +837,21 @@ ib_recv:
   //NCCLCHECK(ncclIbMalloc((void**)&stage->buffer, sizeof(struct ncclIbQpInfo)));
   memcpy(stage->buffer, &qpInfo, sizeof(struct ncclIbQpInfo));
 ib_send:
-  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND, &rComm->base.sock, stage->buffer, sizeof(struct ncclIbQpInfo), &stage->offset));
+  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &rComm->base.sock, stage->buffer, sizeof(struct ncclIbQpInfo),
+                                   &stage->offset), res, fail);
   if (stage->offset < sizeof(struct ncclIbQpInfo)) return ncclSuccess;
+
+  stage->state = ncclIbCommStatePendingReady;
+  stage->offset = 0;
+ib_recv_ready:
+  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_RECV, &rComm->base.sock, &rComm->base.ready, sizeof(int),
+                                   &stage->offset), res, fail);
+  if (stage->offset != sizeof(int)) return ncclSuccess;
+  if (rComm->base.ready != 1) {
+    WARN("NET/IB: invalid ready value %d", rComm->base.ready);
+    res = ncclRemoteError;
+    goto fail;
+  }
 
   /* reset lComm stage */
   stage->state = ncclIbCommStateStart;
@@ -779,6 +870,8 @@ fail:
     // Only the success path above clears this; never leave it pointing at freed memory.
     stage->comm = NULL;
   }
+  stage->state = ncclIbCommStateStart;
+  stage->offset = 0;
   goto exit;
 }
 
@@ -790,6 +883,7 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
     for (int q=0; q<comm->base.nqps; q++)
       if (comm->base.qps[q] != NULL) NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q]));
     if (comm->fifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->fifoMr));
+    if (comm->sizesFifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->sizesFifoMr));
     if (commDev->putSignalScratchpadMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->putSignalScratchpadMr));
     NCCLCHECK(ncclIbDestroyBase(&commDev->base));
     NCCLCHECK(ncclFree(comm));
@@ -809,6 +903,7 @@ ncclResult_t ncclIbCloseRecv(void* recvComm) {
       if (comm->gpuFlush.hostMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->gpuFlush.hostMr));
     }
     if (comm->remCtsFifo.mr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->remCtsFifo.mr));
+    if (comm->sizesFifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->sizesFifoMr));
     NCCLCHECK(ncclIbDestroyBase(&commDev->base));
     NCCLCHECK(ncclFree(comm));
   }
@@ -818,6 +913,8 @@ ncclResult_t ncclIbCloseRecv(void* recvComm) {
 ncclResult_t ncclIbCloseListen(void* listenComm) {
   struct ncclIbListenComm* comm = (struct ncclIbListenComm*)listenComm;
   if (comm) {
+    if (comm->stage.comm) NCCLCHECK(ncclIbCloseRecv(comm->stage.comm));
+    NCCLCHECK(ncclFree(comm->stage.buffer));
     NCCLCHECK(ncclSocketClose(&comm->sock));
     NCCLCHECK(ncclFree(comm));
   }

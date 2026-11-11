@@ -49,5 +49,6 @@ ncclResult_t ncclGpuGdrSupport(int* gdrSupport);
 
 extern ncclNet_t ncclNetIb;
 extern ncclNet_t ncclNetSocket;
+ncclResult_t ncclIbAbortConnect(void* opaqueHandle);
 
 #endif
