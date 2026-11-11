@@ -2256,6 +2256,13 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
     goto fail;
   }
 
+  if (internalConfigPtr->trafficClass != PCCL_CONFIG_UNDEF_INT &&
+      (internalConfigPtr->trafficClass < -1 || internalConfigPtr->trafficClass > 255)) {
+    ERROR("Invalid config trafficClass attribute value %d", internalConfigPtr->trafficClass);
+    ret = ncclInvalidArgument;
+    goto fail;
+  }
+
   if (internalConfigPtr->shrinkShare != PCCL_CONFIG_UNDEF_INT && internalConfigPtr->shrinkShare != 0 && internalConfigPtr->shrinkShare != 1) {
     ERROR("Invalid config shrinkShare attribute value %d", internalConfigPtr->shrinkShare);
     ret = ncclInvalidArgument;
@@ -2274,6 +2281,7 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
   /* assign config to communicator */
   comm->config.blocking = internalConfigPtr->blocking;
   comm->config.splitShare = internalConfigPtr->splitShare;
+  comm->config.trafficClass = internalConfigPtr->trafficClass;
   comm->config.commName = internalConfigPtr->commName;
   comm->config.CTAPolicy = internalConfigPtr->CTAPolicy;
   comm->config.minCTAs = internalConfigPtr->minCTAs;

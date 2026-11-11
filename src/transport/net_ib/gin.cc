@@ -256,7 +256,7 @@ ncclResult_t ncclGinIbP2PBarrier(struct ncclGinIbCollComm* cComm) {
 
 static ncclResult_t ncclGinIbGetGidIndexAdapter(struct ibv_context* context, uint8_t portNum,
                                                 struct ibv_port_attr* portAttr, int* gidIndex) {
-  return ncclIbGetGidIndex(context, portNum, portAttr->gid_tbl_len, gidIndex);
+  return ncclIbGetGidIndex(context, portNum, portAttr, gidIndex);
 }
 
 ncclResult_t ncclGinIbConnect(void* ctx, void* handles[], int nranks, int rank,
@@ -370,12 +370,24 @@ ncclResult_t ncclGinIbGdakiConnect(void* ctx, void* handles[], int nranks, int r
   return ncclSuccess;
 }
 
+static ncclResult_t ncclGinIbTrafficClass(int value, int* normalized) {
+  if (value == NCCL_CONFIG_UNDEF_INT) value = NCCL_NET_TRAFFIC_CLASS_UNDEF;
+  if (value < -1 || value > 255) {
+    WARN("NET/IB: Invalid GIN traffic class %d", value);
+    return ncclInvalidArgument;
+  }
+  *normalized = value;
+  return ncclSuccess;
+}
+
 ncclResult_t ncclGinIbGdakiCreateContext(void* collComm, ncclGinConfig_v13_t* config,
                                          void** ginCtx, ncclNetDeviceHandle_v11_t** devHandle) {
   struct ncclGinIbCollComm* cComm = (struct ncclGinIbCollComm*)collComm;
+  int trafficClass;
+  NCCLCHECK(ncclGinIbTrafficClass(config->trafficClass, &trafficClass));
   NCCLCHECK(ncclGinGdakiCreateContext(cComm, config->nSignals, config->nCounters,
                                       config->nContexts, config->queueDepth,
-                                      config->trafficClass, ginCtx, devHandle));
+                                      trafficClass, ginCtx, devHandle));
   return ncclSuccess;
 }
 
@@ -483,7 +495,9 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
                                          void** ginCtx, ncclNetDeviceHandle_v11_t** /*devHandle*/) {
   ncclResult_t ret = ncclSuccess;
   struct ncclGinIbCollComm* cComm = (struct ncclGinIbCollComm*)collComm;
-  ncclIbSetTrafficClass(cComm->ctx, config->trafficClass);
+  int trafficClass;
+  NCCLCHECK(ncclGinIbTrafficClass(config->trafficClass, &trafficClass));
+  NCCLCHECK(ncclIbSetTrafficClass(cComm->ctx, trafficClass));
 
   if (config->queueDepth != 0) {
     WARN("GIN_IB_PROXY does not support specifying qp depth");
@@ -519,8 +533,8 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
       do {
         if (gc->fullSendComm[connectPeer] == NULL) {
           pendingHandle = handles + NCCL_NET_HANDLE_MAXSIZE * connectPeer;
-          NCCLCHECKGOTO(ncclNetIb.connect(cComm->dev,
-                                          pendingHandle, &gc->fullSendComm[connectPeer]),
+          NCCLCHECKGOTO(ncclIbConnectWithTrafficClass(cComm->dev, pendingHandle, trafficClass,
+                                                       &gc->fullSendComm[connectPeer]),
                         ret, end);
           if (gc->fullSendComm[connectPeer]) pendingHandle = NULL;
         }

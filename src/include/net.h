@@ -50,5 +50,6 @@ ncclResult_t ncclGpuGdrSupport(int* gdrSupport);
 extern ncclNet_t ncclNetIb;
 extern ncclNet_t ncclNetSocket;
 ncclResult_t ncclIbAbortConnect(void* opaqueHandle);
+ncclResult_t ncclIbConnectWithTrafficClass(int dev, void* opaqueHandle, int trafficClass, void** sendComm);
 
 #endif

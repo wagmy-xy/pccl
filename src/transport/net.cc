@@ -98,6 +98,7 @@ struct sendResources {
   // proxy teardown even if the request buffer is discarded on abort.
   alignas(uint64_t) ncclNetHandle_t ibConnectHandle;
   bool ibConnectHandleInitialized;
+  int trafficClass;
   struct ncclSendMem* sendMem;
   struct ncclRecvMem* recvMem;
 
@@ -187,6 +188,7 @@ struct setupReq {
   int useGdr;
   int channelId;
   int connIndex;
+  int trafficClass;
 };
 
 /* Determine if we will use this transport for this peer and return connect
@@ -198,6 +200,7 @@ static ncclResult_t sendSetup(ncclComm_t comm, struct ncclTopoGraph* graph, stru
   send->conn.shared = req.shared = graph || connIndex == 0 ? 0 : ncclParamNetSharedBuffers() != -2 ? ncclParamNetSharedBuffers() : 1;
   req.channelId = channelId;
   req.connIndex = connIndex;
+  req.trafficClass = comm->config.trafficClass;
 
   int proxyRank;
   int64_t netId;
@@ -236,6 +239,7 @@ static ncclResult_t recvSetup(ncclComm_t comm, struct ncclTopoGraph* graph, stru
   recv->conn.shared = req.shared = graph || connIndex == 0 ? 0 : ncclParamNetSharedBuffers() != -2 ? ncclParamNetSharedBuffers() : 1;
   req.channelId = channelId;
   req.connIndex = connIndex;
+  req.trafficClass = comm->config.trafficClass;
 
   // Use myInfo->rank as the receiver uses its own NIC
   int64_t netId;
@@ -582,6 +586,7 @@ static ncclResult_t sendProxySetup(struct ncclProxyConnection* connection, struc
   resources->useGdr = req->useGdr;
   resources->channelId = req->channelId;
   resources->connIndex = req->connIndex;
+  resources->trafficClass = req->trafficClass == PCCL_CONFIG_UNDEF_INT ? -1 : req->trafficClass;
   resources->u2mmMkeyPtr = NULL;
   ncclNetProperties_t props;
   NCCLCHECK(ncclNetGetProperties(req->netDev, &props));
@@ -621,6 +626,14 @@ static ncclResult_t recvProxySetup(struct ncclProxyConnection* connection, struc
   return ncclSuccess;
 }
 
+extern int64_t ncclParamIbTc();
+extern int64_t ncclParamIbSl();
+
+static ncclResult_t netConnectWithTrafficClass(int dev, void* handle, int trafficClass, void** sendComm) {
+  if (ncclNet == &ncclNetIb) return ncclIbConnectWithTrafficClass(dev, handle, trafficClass, sendComm);
+  return ncclNetConnect(dev, handle, sendComm);
+}
+
 static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState, void* reqBuff, int reqSize, void* respBuff, int respSize, int* done) {
   struct sendResources* resources = (struct sendResources*)(connection->transportResources);
   if (reqSize != sizeof(ncclNetHandle_t)) return ncclInternalError;
@@ -653,20 +666,34 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
       }
       struct ncclSharedNetComms* comms = progressState->netComms[resources->netDev]+resources->tpRemoteRank;
       // let only one local rank connect to a tpRemoteRank to avoid duplicate connections
-      if (comms->activeConnect[resources->channelId] == 0)
+      int tc = 0, sl = 0;
+      if (ncclNet == &ncclNetIb) {
+        tc = ncclParamIbTc() != -1 ? ncclParamIbTc() : (resources->trafficClass != -1 ? resources->trafficClass : 0);
+        sl = ncclParamIbSl() != -1 ? ncclParamIbSl() : (resources->trafficClass != -1 ? resources->trafficClass : 0);
+      }
+      if (comms->activeConnect[resources->channelId] == 0) {
         comms->activeConnect[resources->channelId] = (resources->tpLocalRank + 1);
+        comms->sendTrafficClass[resources->channelId] = tc;
+        comms->sendServiceLevel[resources->channelId] = sl;
+      } else if (ncclNet == &ncclNetIb &&
+                 (comms->sendTrafficClass[resources->channelId] != tc ||
+                  comms->sendServiceLevel[resources->channelId] != sl)) {
+        WARN("NET/IB: Cannot share a connection with different traffic class or service level");
+        return ncclInvalidUsage;
+      }
       if (comms->sendComm[resources->channelId] == NULL &&
           comms->activeConnect[resources->channelId] == (resources->tpLocalRank + 1)) {
-        NCCLCHECK(ncclNetConnect(resources->netDev, reqBuff, comms->sendComm + resources->channelId));
+        NCCLCHECK(netConnectWithTrafficClass(resources->netDev, reqBuff, resources->trafficClass,
+                                                comms->sendComm + resources->channelId));
       }
       resources->netSendComm = comms->sendComm[resources->channelId];
       if (comms->sendComm[resources->channelId]) comms->sendRefCount[resources->channelId]++;
     } else {
-      NCCLCHECK(ncclNetConnect(resources->netDev, reqBuff, &resources->netSendComm));
+      NCCLCHECK(netConnectWithTrafficClass(resources->netDev, reqBuff, resources->trafficClass, &resources->netSendComm));
     }
   } else {
     // Connect to remote peer
-    NCCLCHECK(ncclNetConnect(resources->netDev, reqBuff, &resources->netSendComm));
+    NCCLCHECK(netConnectWithTrafficClass(resources->netDev, reqBuff, resources->trafficClass, &resources->netSendComm));
     connection->proxyAppendPtr = &connection->proxyAppend;
   }
   if (resources->netSendComm == NULL) {

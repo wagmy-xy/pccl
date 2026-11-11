@@ -537,6 +537,10 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
   ncclResult_t status = ncclSuccess;
 
   struct ncclGinIbCollComm *cComm = (struct ncclGinIbCollComm *)collComm;
+  NCCLCHECK(ncclIbValidateQosParams());
+  const int ib_sl = (ncclParamIbSl() != -1) ? ncclParamIbSl() : (trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF) ? trafficClass : 0;
+  const int ib_tc = (ncclParamIbTc() != -1) ? ncclParamIbTc() : (trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF) ? trafficClass : 0;
+  NCCLCHECK(ncclIbValidateQosServiceLevel(ib_sl, ncclIbDevs[cComm->dev].link));
 
   char pciBusId[MAX_PCI_ADDRESS_LEN];
 
@@ -573,8 +577,6 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
   GdakiGlobalGPUBufferTable<uint64_t> *counters_table = new GdakiGlobalGPUBufferTable<uint64_t>();
   GdakiGlobalGPUBufferTable<uint64_t> *signals_table = new GdakiGlobalGPUBufferTable<uint64_t>();
 
-  const int ib_sl = (ncclParamIbSl() != -1) ? ncclParamIbSl() : (trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF) ? trafficClass : 0;
-  const int ib_tc = (ncclParamIbTc() != -1) ? ncclParamIbTc() : (trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF) ? trafficClass : 0;
   int ib_gid_index = 0;
 
   NCCLCHECKGOTO(cComm->getProperties(cComm->dev, &props), status, out);
