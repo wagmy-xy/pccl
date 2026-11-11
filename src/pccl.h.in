@@ -112,6 +112,9 @@ typedef struct pcclConfig_v23000 {
   int shrinkShare;
   int nvlsCTAs;
   int nChannelsPerNetPeer;
+  int nvlinkCentricSched; // Reserved for compatibility; PCCL does not implement this scheduling mode.
+  int reservedGraphUsageMode; // Preserve NCCL field offsets until graphUsageMode is added.
+  int numRmaCtx; // Reserved for compatibility; PCCL does not implement host RMA contexts.
 } pcclConfig_t;
 
 typedef struct pcclSimInfo_v22200 {
@@ -163,6 +166,9 @@ typedef enum { pcclInt8       = 0, pcclChar       = 0,
   PCCL_CONFIG_UNDEF_INT,                    /* shrinkShare */           \
   PCCL_CONFIG_UNDEF_INT,                    /* nvlsCTAs */              \
   PCCL_CONFIG_UNDEF_INT,                    /* nChannelsPerNetPeer */   \
+  PCCL_CONFIG_UNDEF_INT,                    /* nvlinkCentricSched */    \
+  PCCL_CONFIG_UNDEF_INT,                    /* reservedGraphUsageMode */ \
+  PCCL_CONFIG_UNDEF_INT,                    /* numRmaCtx */             \
 }
 
 #define PCCL_SIM_INFO_INITIALIZER {                                         \
