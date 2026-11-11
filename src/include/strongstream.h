@@ -20,12 +20,14 @@
 struct ncclCudaGraph {
   hggcGraph_t graph;
   unsigned long long graphId;
+  int graphUsageMode;
 };
 
 inline struct ncclCudaGraph ncclCudaGraphNone() {
   struct ncclCudaGraph tmp;
   tmp.graph = nullptr;
   tmp.graphId = ULLONG_MAX;
+  tmp.graphUsageMode = 2;
   return tmp;
 }
 
@@ -37,7 +39,7 @@ inline bool ncclCudaGraphSame(struct ncclCudaGraph a, struct ncclCudaGraph b) {
   return a.graphId == b.graphId;
 }
 
-ncclResult_t ncclCudaGetCapturingGraph(struct ncclCudaGraph* graph, hggcStream_t stream);
+ncclResult_t ncclCudaGetCapturingGraph(struct ncclCudaGraph* graph, hggcStream_t stream, int graphUsageMode);
 ncclResult_t ncclCudaGraphAddDestructor(struct ncclCudaGraph graph, hggcHostFn_t fn, void* arg);
 
 /* ncclStrongStream: An abstraction over CUDA streams that do not lose their

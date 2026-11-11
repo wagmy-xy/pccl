@@ -2011,7 +2011,10 @@ static ncclResult_t ncclPlannerSetCapturingGraph(ncclComm_t comm, struct ncclInf
     while (true) {
       if (l == nullptr) { // Got to the end, this must be a new stream.
         struct ncclCudaGraph graph;
-        NCCLCHECK(ncclCudaGetCapturingGraph(&graph, info->stream));
+        NCCLCHECK(ncclCudaGetCapturingGraph(&graph, info->stream, comm->config.graphUsageMode));
+        if (ncclCudaGraphValid(graph) && comm->config.graphUsageMode == 0) {
+          INFO(NCCL_COLL | NCCL_P2P, "Graph capture violates graphUsageMode=0 and may lead to hangs");
+        }
         if (planner->streams != nullptr && !ncclCudaGraphSame(planner->capturingGraph, graph)) {
           ERROR("Streams given to a communicator within a PCCL group must either be all uncaptured or all captured by the same graph.");
           return ncclInvalidUsage;

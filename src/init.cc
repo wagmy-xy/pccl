@@ -69,6 +69,7 @@ NCCL_PARAM(AllocP2pNetLLBuffers, "ALLOC_P2P_NET_LL_BUFFERS", 0);
 NCCL_PARAM(NChannelsPerNetPeer, "NCHANNELS_PER_NET_PEER", PCCL_CONFIG_UNDEF_INT);
 NCCL_PARAM(NvlinkUtilCentricSchedEnable, "NVLINK_UTIL_CENTRIC_SCHED_ENABLE", PCCL_CONFIG_UNDEF_INT);
 NCCL_PARAM(NumRmaCtx, "NUM_RMA_CTX", PCCL_CONFIG_UNDEF_INT);
+NCCL_PARAM(GraphMixingSupport, "GRAPH_MIXING_SUPPORT", PCCL_CONFIG_UNDEF_INT);
 
 // GDRCOPY support: Off by default
 NCCL_PARAM(GdrCopyEnable, "GDRCOPY_ENABLE", 0);
@@ -2138,6 +2139,7 @@ static ncclResult_t envConfigOverride(ncclComm_t comm) {
   int64_t nChannelsPerNetPeerEnv = ncclParamNChannelsPerNetPeer();
   int64_t nvlinkCentricSchedEnv = ncclParamNvlinkUtilCentricSchedEnable();
   int64_t numRmaCtxEnv = ncclParamNumRmaCtx();
+  int64_t graphMixingEnv = ncclParamGraphMixingSupport();
 
   if (nChannelsPerNetPeerEnv != PCCL_CONFIG_UNDEF_INT) {
     if (nChannelsPerNetPeerEnv > 0 && nChannelsPerNetPeerEnv <= MAXCHANNELS)
@@ -2155,6 +2157,11 @@ static ncclResult_t envConfigOverride(ncclComm_t comm) {
     comm->config.numRmaCtx = (int)numRmaCtxEnv;
   } else if (numRmaCtxEnv != PCCL_CONFIG_UNDEF_INT) {
     INFO(NCCL_ENV, "Ignoring invalid PCCL_NUM_RMA_CTX=%lld", (long long)numRmaCtxEnv);
+  }
+  if (graphMixingEnv == 0 || graphMixingEnv == 1) {
+    comm->config.graphUsageMode = graphMixingEnv ? 2 : 0;
+  } else if (graphMixingEnv != PCCL_CONFIG_UNDEF_INT) {
+    INFO(NCCL_ENV, "Ignoring invalid PCCL_GRAPH_MIXING_SUPPORT=%lld", (long long)graphMixingEnv);
   }
 
   /* override configuration from env variable. */
@@ -2261,6 +2268,11 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
         (internalConfigPtr->magic == NCCL_API_MAGIC && internalConfigPtr->version < NCCL_VERSION(2, 29, 0))) {
       internalConfigPtr->numRmaCtx = defaultConfig.numRmaCtx;
     }
+    if (realSize < offsetof(ncclConfig_t, graphUsageMode) + sizeof(internalConfigPtr->graphUsageMode) ||
+        (internalConfigPtr->magic == PCCL_API_MAGIC && internalConfigPtr->version < PCCL_VERSION(2, 3, 0)) ||
+        (internalConfigPtr->magic == NCCL_API_MAGIC && internalConfigPtr->version < NCCL_VERSION(2, 29, 0))) {
+      internalConfigPtr->graphUsageMode = defaultConfig.graphUsageMode;
+    }
     if (pcclVersion < PCCL_VERSION(1, 4, 0)) {
       internalConfigPtr->blocking = defaultConfig.blocking;
       internalConfigPtr->cgaClusterSize = defaultConfig.cgaClusterSize;
@@ -2331,6 +2343,12 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
     ret = ncclInvalidArgument;
     goto fail;
   }
+  if (internalConfigPtr->graphUsageMode != PCCL_CONFIG_UNDEF_INT &&
+      (internalConfigPtr->graphUsageMode < 0 || internalConfigPtr->graphUsageMode > 2)) {
+    ERROR("Invalid config graphUsageMode attribute value %d", internalConfigPtr->graphUsageMode);
+    ret = ncclInvalidArgument;
+    goto fail;
+  }
 
   /* default config value can be tuned on different platform. */
   NCCL_CONFIG_DEFAULT(internalConfigPtr, blocking, PCCL_CONFIG_UNDEF_INT, 1, "Blocking", "%d");
@@ -2342,6 +2360,7 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
   NCCL_CONFIG_DEFAULT(internalConfigPtr, shrinkShare, PCCL_CONFIG_UNDEF_INT, 0, "shrinkShare", "%d");
   NCCL_CONFIG_DEFAULT(internalConfigPtr, nvlinkCentricSched, PCCL_CONFIG_UNDEF_INT, 0, "nvlinkCentricSched", "%d");
   NCCL_CONFIG_DEFAULT(internalConfigPtr, numRmaCtx, PCCL_CONFIG_UNDEF_INT, 1, "numRmaCtx", "%d");
+  NCCL_CONFIG_DEFAULT(internalConfigPtr, graphUsageMode, PCCL_CONFIG_UNDEF_INT, 2, "graphUsageMode", "%d");
 
   /* assign config to communicator */
   comm->config.blocking = internalConfigPtr->blocking;
@@ -2355,6 +2374,7 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
   comm->config.nChannelsPerNetPeer = internalConfigPtr->nChannelsPerNetPeer;
   comm->config.nvlinkCentricSched = internalConfigPtr->nvlinkCentricSched;
   comm->config.numRmaCtx = internalConfigPtr->numRmaCtx;
+  comm->config.graphUsageMode = internalConfigPtr->graphUsageMode;
 
   NCCLCHECK(envConfigOverride(comm));
 
