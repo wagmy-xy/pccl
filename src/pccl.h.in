@@ -95,7 +95,7 @@ typedef enum {
   pcclStatGpuMemTotal        = 3    // Total allocated GPU memory tracked by PCCL (bytes)
 } pcclCommMemStat_t;
 
-typedef struct pcclConfig_v22700 {
+typedef struct pcclConfig_v23000 {
   size_t size;
   unsigned int magic;
   unsigned int version;
@@ -111,6 +111,7 @@ typedef struct pcclConfig_v22700 {
   int CTAPolicy;
   int shrinkShare;
   int nvlsCTAs;
+  int nChannelsPerNetPeer;
 } pcclConfig_t;
 
 typedef struct pcclSimInfo_v22200 {
@@ -161,6 +162,7 @@ typedef enum { pcclInt8       = 0, pcclChar       = 0,
   PCCL_CONFIG_UNDEF_INT,                    /* CTAPolicy */             \
   PCCL_CONFIG_UNDEF_INT,                    /* shrinkShare */           \
   PCCL_CONFIG_UNDEF_INT,                    /* nvlsCTAs */              \
+  PCCL_CONFIG_UNDEF_INT,                    /* nChannelsPerNetPeer */   \
 }
 
 #define PCCL_SIM_INFO_INITIALIZER {                                         \

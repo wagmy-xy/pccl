@@ -66,6 +66,7 @@ NCCL_PARAM(CtaPolicy, "CTA_POLICY", PCCL_CONFIG_UNDEF_INT);
 NCCL_PARAM(WinEnable, "WIN_ENABLE", 1);
 NCCL_PARAM(SetCpuStackSize, "SET_CPU_STACK_SIZE", 1);
 NCCL_PARAM(AllocP2pNetLLBuffers, "ALLOC_P2P_NET_LL_BUFFERS", 0);
+NCCL_PARAM(NChannelsPerNetPeer, "NCHANNELS_PER_NET_PEER", PCCL_CONFIG_UNDEF_INT);
 
 // GDRCOPY support: Off by default
 NCCL_PARAM(GdrCopyEnable, "GDRCOPY_ENABLE", 0);
@@ -1227,6 +1228,7 @@ static ncclResult_t initTransportsRank(ncclComm_t comm, ncclComm_t parent, uint6
     int nChannels;
     int nGraphChannels;
     int p2pnChannelsPerPeer;
+    int p2pNetChannelsSet;
     int ceAutoAllGatherEligible;
     struct graphInfo graphInfo[NCCL_ALGO_COLLNET + 1];
     struct ncclTopoRanks topoRanks;
@@ -1445,6 +1447,8 @@ static ncclResult_t initTransportsRank(ncclComm_t comm, ncclComm_t parent, uint6
     allGather3Data[rank].graphInfo[a].typeInter = graphs[a]->typeInter;
   }
   allGather3Data[rank].p2pnChannelsPerPeer = comm->p2pnChannelsPerPeer;
+  allGather3Data[rank].p2pNetChannelsSet = comm->config.nChannelsPerNetPeer != PCCL_CONFIG_UNDEF_INT;
+  comm->p2pNetChannelsSet = allGather3Data[rank].p2pNetChannelsSet;
 
   NCCLCHECKGOTO(ncclTopoPreset(comm, treeGraph, ringGraph, collNetGraph, fcGraph, &allGather3Data[rank].topoRanks), res, fail);
 
@@ -1542,6 +1546,7 @@ static ncclResult_t initTransportsRank(ncclComm_t comm, ncclComm_t parent, uint6
       graphs[a]->typeInter = std::max(allGather3Data[i].graphInfo[a].typeInter, graphs[a]->typeInter);
     }
     comm->p2pnChannelsPerPeer = std::min(comm->p2pnChannelsPerPeer, allGather3Data[i].p2pnChannelsPerPeer);
+    comm->p2pNetChannelsSet |= allGather3Data[i].p2pNetChannelsSet;
   }
 
   if (comm->nChannels < nChannelsOrig) {
@@ -2128,6 +2133,14 @@ static ncclResult_t envConfigOverride(ncclComm_t comm) {
   int splitShareEnv;
   int ctaPolicyEnv;
   int shrinkShareEnv;
+  int64_t nChannelsPerNetPeerEnv = ncclParamNChannelsPerNetPeer();
+
+  if (nChannelsPerNetPeerEnv != PCCL_CONFIG_UNDEF_INT) {
+    if (nChannelsPerNetPeerEnv > 0 && nChannelsPerNetPeerEnv <= MAXCHANNELS)
+      comm->config.nChannelsPerNetPeer = (int)nChannelsPerNetPeerEnv;
+    else
+      INFO(NCCL_ENV, "Ignoring invalid PCCL_NCHANNELS_PER_NET_PEER=%lld", (long long)nChannelsPerNetPeerEnv);
+  }
 
   /* override configuration from env variable. */
   blockingEnv = ncclParamCommBlocking();
@@ -2217,6 +2230,12 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
 
     unsigned int pcclVersion = 0;
     NCCLCHECKGOTO(pcclConfigCheck(internalConfigPtr->version, internalConfigPtr->magic, &pcclVersion), ret, fail);
+    // Old structures may include tail padding where the first new field resides.
+    if (realSize < offsetof(ncclConfig_t, nChannelsPerNetPeer) + sizeof(internalConfigPtr->nChannelsPerNetPeer) ||
+        (internalConfigPtr->magic == PCCL_API_MAGIC && internalConfigPtr->version < PCCL_VERSION(2, 3, 0)) ||
+        (internalConfigPtr->magic == NCCL_API_MAGIC && internalConfigPtr->version < NCCL_VERSION(2, 28, 0))) {
+      internalConfigPtr->nChannelsPerNetPeer = defaultConfig.nChannelsPerNetPeer;
+    }
     if (pcclVersion < PCCL_VERSION(1, 4, 0)) {
       internalConfigPtr->blocking = defaultConfig.blocking;
       internalConfigPtr->cgaClusterSize = defaultConfig.cgaClusterSize;
@@ -2269,6 +2288,13 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
     goto fail;
   }
 
+  if (internalConfigPtr->nChannelsPerNetPeer != PCCL_CONFIG_UNDEF_INT &&
+      (internalConfigPtr->nChannelsPerNetPeer <= 0 || internalConfigPtr->nChannelsPerNetPeer > MAXCHANNELS)) {
+    ERROR("Invalid config nChannelsPerNetPeer attribute value %d", internalConfigPtr->nChannelsPerNetPeer);
+    ret = ncclInvalidArgument;
+    goto fail;
+  }
+
   /* default config value can be tuned on different platform. */
   NCCL_CONFIG_DEFAULT(internalConfigPtr, blocking, PCCL_CONFIG_UNDEF_INT, 1, "Blocking", "%d");
   NCCL_CONFIG_DEFAULT(internalConfigPtr, minCTAs, PCCL_CONFIG_UNDEF_INT, 1, "Min CTAs", "%d");
@@ -2287,6 +2313,7 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
   comm->config.minCTAs = internalConfigPtr->minCTAs;
   comm->config.maxCTAs = internalConfigPtr->maxCTAs;
   comm->config.shrinkShare = internalConfigPtr->shrinkShare;
+  comm->config.nChannelsPerNetPeer = internalConfigPtr->nChannelsPerNetPeer;
 
   NCCLCHECK(envConfigOverride(comm));
 
