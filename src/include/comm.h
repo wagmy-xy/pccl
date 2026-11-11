@@ -457,6 +457,7 @@ struct pcclComm {
   int p2pnChannels;
   int p2pnChannelsPerPeer;
   int p2pNetChannelsSet;
+  int p2pMaxPeers;
   int p2pSchedGroupSize;
   int p2pChannels[MAXCHANNELS];
   // Channel shuffle

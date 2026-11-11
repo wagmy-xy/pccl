@@ -95,6 +95,25 @@ typedef enum {
   pcclStatGpuMemTotal        = 3    // Total allocated GPU memory tracked by PCCL (bytes)
 } pcclCommMemStat_t;
 
+// Retain the old public structure tag for applications that name it directly.
+struct pcclConfig_v22700 {
+  size_t size;
+  unsigned int magic;
+  unsigned int version;
+  int blocking;
+  int cgaClusterSize;
+  int minCTAs;
+  int maxCTAs;
+  const char *netName;
+  int splitShare;
+  int trafficClass;
+  const char *commName;
+  int collnetEnable;
+  int CTAPolicy;
+  int shrinkShare;
+  int nvlsCTAs;
+};
+
 typedef struct pcclConfig_v23000 {
   size_t size;
   unsigned int magic;
@@ -115,6 +134,7 @@ typedef struct pcclConfig_v23000 {
   int nvlinkCentricSched; // Reserved for compatibility; PCCL does not implement this scheduling mode.
   int graphUsageMode;
   int numRmaCtx; // Reserved for compatibility; PCCL does not implement host RMA contexts.
+  int maxP2pPeers;
 } pcclConfig_t;
 
 typedef struct pcclSimInfo_v22200 {
@@ -169,6 +189,7 @@ typedef enum { pcclInt8       = 0, pcclChar       = 0,
   PCCL_CONFIG_UNDEF_INT,                    /* nvlinkCentricSched */    \
   PCCL_CONFIG_UNDEF_INT,                    /* graphUsageMode */        \
   PCCL_CONFIG_UNDEF_INT,                    /* numRmaCtx */             \
+  PCCL_CONFIG_UNDEF_INT,                    /* maxP2pPeers */           \
 }
 
 #define PCCL_SIM_INFO_INITIALIZER {                                         \
