@@ -609,6 +609,8 @@ ib_connect_check:
                                 IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_REMOTE_READ), res, fail);
   meta.fifoRkey = comm->fifoMr->rkey;
   meta.fifoAddr = (uint64_t)comm->ctsFifo;
+  NCCLCHECKGOTO(wrap_ibv_reg_mr(&comm->sizesFifoMr, comm->dev.base.pd, comm->sizesFifo,
+                                sizeof(comm->sizesFifo), IBV_ACCESS_LOCAL_WRITE), res, fail);
   meta.oooRqSize = ncclIbGetOooRqSize(dev);
 
   // Register a small scratchpad MR that the GIN proxy iputSignal path uses as
@@ -652,6 +654,8 @@ ib_connect:
 
   struct ncclIbConnectionMetadata remMeta;
   memcpy(&remMeta, stage->buffer, sizeof(remMeta));
+  comm->remSizesFifoAddr = remMeta.sizesFifoAddr;
+  comm->remSizesFifoRkey = remMeta.sizesFifoRkey;
   for (int q = 0; q < comm->base.nqps; q++) {
     struct ibv_qp* qp = comm->base.qps[q];
     if (remMeta.qpInfo[q].ece_supported) {
@@ -849,6 +853,9 @@ ib_recv:
     }
   }
 
+  NCCLCHECKGOTO(wrap_ibv_reg_mr(&rComm->sizesFifoMr, rComm->dev.base.pd, rComm->sizesFifo,
+                                sizeof(rComm->sizesFifo), IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE), res, fail);
+
   // Fill Handle
   meta.tc = remMeta.tc;
   meta.sl = remMeta.sl;
@@ -859,6 +866,8 @@ ib_recv:
   meta.iid=gid.global.interface_id;
   meta.mtu=remMeta.mtu;
   meta.oooRqSize = ncclIbGetOooRqSize(lComm->dev);
+  meta.sizesFifoAddr = (uint64_t)rComm->sizesFifo;
+  meta.sizesFifoRkey = rComm->sizesFifoMr->rkey;
 
   stage->state = ncclIbCommStateSend;
   stage->offset = 0;
@@ -955,6 +964,7 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
     for (int q=0; q<comm->base.nqps; q++)
       if (comm->base.qps[q] != NULL) NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q]));
     if (comm->fifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->fifoMr));
+    if (comm->sizesFifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->sizesFifoMr));
     if (commDev->putSignalScratchpadMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->putSignalScratchpadMr));
     NCCLCHECK(ncclIbDestroyBase(&commDev->base));
     NCCLCHECK(ncclFree(comm));
@@ -974,6 +984,7 @@ ncclResult_t ncclIbCloseRecv(void* recvComm) {
       if (comm->gpuFlush.hostMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->gpuFlush.hostMr));
     }
     if (comm->remCtsFifo.mr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->remCtsFifo.mr));
+    if (comm->sizesFifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->sizesFifoMr));
     NCCLCHECK(ncclIbDestroyBase(&commDev->base));
     NCCLCHECK(ncclFree(comm));
   }
