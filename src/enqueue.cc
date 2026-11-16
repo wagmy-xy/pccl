@@ -1493,8 +1493,6 @@ static ncclResult_t scheduleP2pTasksToPlan(ncclComm_t comm, int* p2pEpoch, int* 
   int nChannelsMin = nChannelsMax;
   // Try to use all channels, but one channel per operation.
   while (nChannelsMin*comm->nRanks > comm->p2pnChannels && nChannelsMin > 1) nChannelsMin /= 2;
-  // Avoid overloading channels with 8+ operations as we loose the sync warp, hence a bit of bandwidth.
-  while (nChannelsMax*comm->nRanks > comm->p2pnChannels*4 && nChannelsMax > 1) nChannelsMax /= 2;
 
   // Traverse the pre-computed p2p schedule. p2pRound (0..nRanks-1) and p2pEpoch
   // persist across plans via pointer args, so after a budget-triggered split the
