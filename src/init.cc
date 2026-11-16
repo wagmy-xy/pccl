@@ -66,7 +66,10 @@ NCCL_PARAM(CtaPolicy, "CTA_POLICY", PCCL_CONFIG_UNDEF_INT);
 NCCL_PARAM(WinEnable, "WIN_ENABLE", 1);
 NCCL_PARAM(SetCpuStackSize, "SET_CPU_STACK_SIZE", 1);
 NCCL_PARAM(AllocP2pNetLLBuffers, "ALLOC_P2P_NET_LL_BUFFERS", 0);
+NCCL_PARAM(NChannelsPerNetPeer, "NCHANNELS_PER_NET_PEER", PCCL_CONFIG_UNDEF_INT);
+NCCL_PARAM(NvlinkUtilCentricSchedEnable, "NVLINK_UTIL_CENTRIC_SCHED_ENABLE", PCCL_CONFIG_UNDEF_INT);
 NCCL_PARAM(GraphMixingSupport, "GRAPH_MIXING_SUPPORT", PCCL_CONFIG_UNDEF_INT);
+NCCL_PARAM(NumRmaCtx, "NUM_RMA_CTX", PCCL_CONFIG_UNDEF_INT);
 NCCL_PARAM(MaxP2pPeers, "P2P_MAX_PEERS", PCCL_CONFIG_UNDEF_INT);
 
 // GDRCOPY support: Off by default
@@ -2127,7 +2130,10 @@ static ncclResult_t envConfigOverride(ncclComm_t comm) {
   int splitShareEnv;
   int ctaPolicyEnv;
   int shrinkShareEnv;
+  int nChannelsPerNetPeerEnv;
+  int nvlinkUtilCentricSchedEnableEnv;
   int graphMixingSupportEnv;
+  int numRmaCtxEnv;
   int maxP2pPeersEnv;
 
   /* override configuration from env variable. */
@@ -2168,9 +2174,24 @@ static ncclResult_t envConfigOverride(ncclComm_t comm) {
     comm->config.CTAPolicy = ctaPolicyEnv;
   }
 
+  nChannelsPerNetPeerEnv = ncclParamNChannelsPerNetPeer();
+  if (nChannelsPerNetPeerEnv > 0) {
+    comm->config.nChannelsPerNetPeer = nChannelsPerNetPeerEnv;
+  }
+
+  nvlinkUtilCentricSchedEnableEnv = ncclParamNvlinkUtilCentricSchedEnable();
+  if (nvlinkUtilCentricSchedEnableEnv == 0 || nvlinkUtilCentricSchedEnableEnv == 1) {
+    comm->config.nvlinkCentricSched = nvlinkUtilCentricSchedEnableEnv;
+  }
+
   graphMixingSupportEnv = ncclParamGraphMixingSupport();
   if (graphMixingSupportEnv == 0 || graphMixingSupportEnv == 1) {
     comm->config.graphUsageMode = graphMixingSupportEnv == 1 ? 2 : 0;
+  }
+
+  numRmaCtxEnv = ncclParamNumRmaCtx();
+  if (numRmaCtxEnv > 0) {
+    comm->config.numRmaCtx = numRmaCtxEnv;
   }
 
   maxP2pPeersEnv = ncclParamMaxP2pPeers();
@@ -2281,10 +2302,28 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
     goto fail;
   }
 
+  if (internalConfigPtr->nChannelsPerNetPeer != PCCL_CONFIG_UNDEF_INT && (internalConfigPtr->nChannelsPerNetPeer <= 0 || internalConfigPtr->nChannelsPerNetPeer > MAXCHANNELS)) {
+    ERROR("Invalid config nChannelsPerNetPeer attribute value %d", internalConfigPtr->nChannelsPerNetPeer);
+    ret = ncclInvalidArgument;
+    goto fail;
+  }
+
+  if (internalConfigPtr->nvlinkCentricSched != PCCL_CONFIG_UNDEF_INT && internalConfigPtr->nvlinkCentricSched != 0 && internalConfigPtr->nvlinkCentricSched != 1) {
+    ERROR("Invalid config nvlinkCentricSched attribute value %d", internalConfigPtr->nvlinkCentricSched);
+    ret = ncclInvalidArgument;
+    goto fail;
+  }
+
   if (internalConfigPtr->graphUsageMode != PCCL_CONFIG_UNDEF_INT &&
       internalConfigPtr->graphUsageMode != 0 && internalConfigPtr->graphUsageMode != 1 &&
       internalConfigPtr->graphUsageMode != 2) {
     ERROR("Invalid config graphUsageMode attribute value %d", internalConfigPtr->graphUsageMode);
+    ret = ncclInvalidArgument;
+    goto fail;
+  }
+
+  if (internalConfigPtr->numRmaCtx != PCCL_CONFIG_UNDEF_INT && internalConfigPtr->numRmaCtx <= 0) {
+    ERROR("Invalid config numRmaCtx attribute value %d", internalConfigPtr->numRmaCtx);
     ret = ncclInvalidArgument;
     goto fail;
   }
@@ -2313,7 +2352,10 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
   NCCL_CONFIG_DEFAULT(internalConfigPtr, commName, PCCL_CONFIG_UNDEF_PTR, NULL, "Comm name", "%s");
   NCCL_CONFIG_DEFAULT(internalConfigPtr, CTAPolicy, PCCL_CONFIG_UNDEF_INT, PCCL_CTA_POLICY_DEFAULT, "CTA policy flags", "%d");
   NCCL_CONFIG_DEFAULT(internalConfigPtr, shrinkShare, PCCL_CONFIG_UNDEF_INT, 0, "shrinkShare", "%d");
+  NCCL_CONFIG_DEFAULT(internalConfigPtr, nChannelsPerNetPeer, PCCL_CONFIG_UNDEF_INT, PCCL_CONFIG_UNDEF_INT, "nChannelsPerNetPeer", "%d");
+  NCCL_CONFIG_DEFAULT(internalConfigPtr, nvlinkCentricSched, PCCL_CONFIG_UNDEF_INT, 0, "nvlinkCentricSched", "%d");
   NCCL_CONFIG_DEFAULT(internalConfigPtr, graphUsageMode, PCCL_CONFIG_UNDEF_INT, 2, "graphUsageMode", "%d");
+  NCCL_CONFIG_DEFAULT(internalConfigPtr, numRmaCtx, PCCL_CONFIG_UNDEF_INT, 1, "numRmaCtx", "%d");
   NCCL_CONFIG_DEFAULT(internalConfigPtr, maxP2pPeers, PCCL_CONFIG_UNDEF_INT, PCCL_CONFIG_UNDEF_INT, "maxP2pPeers", "%d");
 
   /* assign config to communicator */
@@ -2325,7 +2367,10 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
   comm->config.minCTAs = internalConfigPtr->minCTAs;
   comm->config.maxCTAs = internalConfigPtr->maxCTAs;
   comm->config.shrinkShare = internalConfigPtr->shrinkShare;
+  comm->config.nChannelsPerNetPeer = internalConfigPtr->nChannelsPerNetPeer;
+  comm->config.nvlinkCentricSched = internalConfigPtr->nvlinkCentricSched;
   comm->config.graphUsageMode = internalConfigPtr->graphUsageMode;
+  comm->config.numRmaCtx = internalConfigPtr->numRmaCtx;
   comm->config.maxP2pPeers = internalConfigPtr->maxP2pPeers;
 
   NCCLCHECK(envConfigOverride(comm));
