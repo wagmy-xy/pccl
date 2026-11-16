@@ -116,7 +116,7 @@ typedef struct pcclConfig_v22800 {
   int CTAPolicy;
   int shrinkShare;
   int nvlsCTAs;
-  int nChannelsPerNetPeer;
+  int nChannelsPerNetPeer; /* Initial network P2P channel demand; PCCL_CONFIG_UNDEF_INT preserves legacy behavior. */
   int nvlinkCentricSched;
   int graphUsageMode;
   int numRmaCtx;
