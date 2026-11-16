@@ -456,6 +456,7 @@ struct pcclComm {
   // Channels (per peer) for p2p
   int p2pnChannels;
   int p2pnChannelsPerPeer;
+  int p2pMaxPeers; // Zero when unset on every rank; otherwise the maximum explicit peer budget.
   int p2pSchedGroupSize;
   int p2pChannels[MAXCHANNELS];
   // Channel shuffle
