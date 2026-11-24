@@ -600,7 +600,7 @@ NCCL_PARAM(GdrCopyFifoEnable, "GDRCOPY_FIFO_ENABLE", 1);
 #define NCCL_WORK_FIFO_BYTES_DEFAULT (1<<25)
 NCCL_PARAM(WorkFifoBytes, "WORK_FIFO_BYTES", NCCL_WORK_FIFO_BYTES_DEFAULT);
 NCCL_PARAM(WorkArgsBytes, "WORK_ARGS_BYTES", INT64_MAX);
-NCCL_PARAM(DmaBufEnable, "DMABUF_ENABLE", 1);
+NCCL_PARAM(DmaBufEnable, "DMABUF_ENABLE", 0);
 
 static ncclResult_t dmaBufSupported(ncclComm_t comm) {
   if (ncclParamDmaBufEnable() == 0 || comm->ncclNet->regMrDmaBuf == NULL ||
