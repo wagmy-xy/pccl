@@ -49,8 +49,7 @@ ncclResult_t ncclGinIbGdrGpuSupport(bool peerMemSupport) {
   int hggcDev;
   HGGCCHECK(hggcGetDevice(&hggcDev));
   int dmaBufSupportOnDevice = 0;
-  if (ncclParamDmaBufEnable())
-    HGCHECK(hgDeviceGetAttribute(&dmaBufSupportOnDevice, HG_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, hggcDev));
+  if (ncclParamDmaBufEnable()) dmaBufSupportOnDevice = ncclHggcDmaBufSupported(hggcDev);
   if (dmaBufSupportOnDevice == 1) {
     INFO_ONCE(NCCL_INIT|NCCL_NET, "GIN prefers DMA-BUF over alixpu_peermem to map GPU memory for RDMA.");
     return ncclSuccess;

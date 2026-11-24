@@ -2185,6 +2185,7 @@ ncclResult_t ncclProxyCreate(ncclComm_t comm) {
     proxyState->allocP2pNetLLBuffers = comm->allocP2pNetLLBuffers;
     proxyState->directMode = comm->directMode;
     proxyState->ncclNet = comm->ncclNet;
+    proxyState->dmaBufSupport = comm->dmaBufSupport;
     proxyState->useU2mmHost = comm->useU2mmHost;
     proxyState->useU2mmDev = comm->useU2mmDev;
     proxyState->profilerContext = comm->profilerContext;

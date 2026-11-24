@@ -12,7 +12,6 @@ pthread_mutex_t ncclIbLock = PTHREAD_MUTEX_INITIALIZER;
 int ncclIbRelaxedOrderingEnabled = 0;
 
 NCCL_PARAM(IbDisable, "IB_DISABLE", 0);
-NCCL_PARAM(DmaBufEnable, "DMABUF_ENABLE", 0);
 NCCL_PARAM(IbDataDirect, "IB_DATA_DIRECT", 0);
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
@@ -392,7 +391,10 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
               (wrap_mlx5dv_symbols() == ncclSuccess && wrap_mlx5dv_is_supported(devices[d]) ?
                IB_PROVIDER_MLX5 : IB_PROVIDER_NONE);
           ncclIbDevs[ncclNIbDevs].pd = NULL;
-          ncclIbDevs[ncclNIbDevs].dmaBufSupported = -1;
+          {
+            std::lock_guard<std::mutex> lock(ncclIbDevs[ncclNIbDevs].mutex);
+            ncclIbDevs[ncclNIbDevs].dmaBufSupported = -1;
+          }
           NCCLCHECK(ncclIbStatsInit(&ncclIbDevs[ncclNIbDevs].stats));
 
           pthread_create(&ncclIbAsyncThread, NULL, ncclIbAsyncThreadMain, ncclIbDevs + ncclNIbDevs);
@@ -456,9 +458,13 @@ ncclResult_t ncclIbGetProperties(int dev, ncclNetProperties_t* props) {
   props->guid = ncclIbDevs[dev].guid;
   props->ptrSupport = NCCL_PTR_HOST;
   if (ncclIbGdrSupport() != ncclSuccess) {
-    INFO(NCCL_NET,"NET/IB : GPU Direct RDMA Disabled for HCA %d '%s' (no module)", dev, ncclIbDevs[dev].devName);
+    INFO(NCCL_NET,"NET/IB : Peer-memory GPU Direct RDMA unavailable for HCA %d '%s' (no module)",
+         dev, ncclIbDevs[dev].devName);
   } else {
     props->ptrSupport |= NCCL_PTR_HGGC;
+  }
+  if (ncclIbDmaBufSupport(dev) == ncclSuccess) {
+    props->ptrSupport |= NCCL_PTR_DMABUF;
   }
   props->speed = ncclIbDevs[dev].speed;
   props->port = ncclIbDevs[dev].port + ncclIbDevs[dev].realPort;

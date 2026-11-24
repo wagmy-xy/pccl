@@ -56,6 +56,8 @@ extern int ncclLegacyCudaRegister();
 } while(false)
 
 ncclResult_t ncclHggcLibraryInit(void);
+bool ncclHggcDmaBufSupported(int device);
+ncclResult_t ncclHggcGetDmaBufFd(int* fd, void* data, size_t size, unsigned long long flags = 0);
 
 extern uint ncclSystemDriverVersionCache;
 extern uint ncclHggcDriverVersionCache;

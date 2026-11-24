@@ -32,6 +32,7 @@ ncclResult_t ncclIbPeerMemSupport() {
 ncclResult_t ncclIbDmaBufSupport(int dev) {
   if (dev < 0 || dev >= MAX_IB_DEVS) return ncclSystemError;
   struct ncclIbDev* ibDev = ncclIbDevs + dev;
+  std::lock_guard<std::mutex> lock(ibDev->mutex);
   if (ibDev->dmaBufSupported == 1) return ncclSuccess;
   if (ibDev->dmaBufSupported == 0) return ncclSystemError;
 
@@ -45,11 +46,13 @@ ncclResult_t ncclIbDmaBufSupport(int dev) {
   }
 
   errno = 0;
-  (void)wrap_direct_ibv_reg_dmabuf_mr(pd, 0ULL /*offset*/, 0ULL /*len*/, 0ULL /*iova*/, -1 /*fd*/, 0 /*access*/);
-  int dev_fail = (errno == EOPNOTSUPP) || (errno == EPROTONOSUPPORT);
-  (void)wrap_ibv_dealloc_pd(pd);
+  struct ibv_mr* mr = wrap_direct_ibv_reg_dmabuf_mr(pd, 0 /*offset*/, 0 /*len*/, 0 /*iova*/, -1 /*fd*/, 0 /*access*/);
+  bool devFail = (errno == EOPNOTSUPP) || (errno == EPROTONOSUPPORT);
+  // An invalid fd should fail, but release an MR if a provider unexpectedly returns one.
+  if (mr != NULL) res = wrap_ibv_dereg_mr(mr);
+  ncclResult_t deallocResult = wrap_ibv_dealloc_pd(pd);
 
-  if (dev_fail) {
+  if (devFail || res != ncclSuccess || deallocResult != ncclSuccess) {
     ibDev->dmaBufSupported = 0;
     return ncclSystemError;
   }

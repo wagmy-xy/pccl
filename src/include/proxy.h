@@ -286,6 +286,7 @@ struct ncclProxyState {
   volatile uint32_t* abortFlag;
   bool directMode;
   ncclNet_t* ncclNet;
+  bool dmaBufSupport;
   int useU2mmHost;
   int useU2mmDev;
   // Service thread

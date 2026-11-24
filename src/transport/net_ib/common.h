@@ -81,7 +81,7 @@ struct ncclIbDev {
     int pdRefs;
     std::mutex mutex;
     struct ncclIbMrCache mrCache;
-    // -1 = not probed, 0 = probed and unsupported, 1 = probed and supported.
+    // Protected by mutex: -1 = not probed, 0 = unsupported, 1 = supported.
     int dmaBufSupported;
 };
 
@@ -355,6 +355,8 @@ ncclResult_t ncclIbListen(int dev, void* opaqueHandle, void** listenComm);
 ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm);
 ncclResult_t ncclIbAccept(void* listenComm, void** recvComm);
 ncclResult_t ncclIbRegMr(void* comm, void* data, int size, int type, void** mhandle);
+ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, uint64_t offset, int fd,
+                             void** mhandle);
 ncclResult_t ncclIbRegMrInternal(void* comm, void* data, size_t size, int type, uint64_t mrFlags,
                                  void** mhandle);
 ncclResult_t ncclIbDeregMr(void* comm, void* mhandle);

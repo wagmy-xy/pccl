@@ -90,23 +90,11 @@ static ncclResult_t gdakiGetDmaBufFd(void *addr, size_t length, int *fd,
                                      bool forceNonDataDirect = false) {
   if (ncclParamDmaBufEnable() == 0) return ncclInvalidUsage;
 
-  static size_t hostPageSize = (size_t)sysconf(_SC_PAGESIZE);
-  size_t aligned_size = ((length + hostPageSize - 1) / hostPageSize) * hostPageSize;
-
   if (ncclParamIbDataDirect() && !forceNonDataDirect) {
-    HGresult st = hgMemGetHandleForAddressRange(
-      (void *)fd, (HGdeviceptr)addr, aligned_size,
-      HG_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
-      HG_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE);
-    if (st == HGGC_SUCCESS) return ncclSuccess;
+    ncclResult_t ret = ncclHggcGetDmaBufFd(fd, addr, length, HG_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE);
+    if (ret == ncclSuccess) return ret;
   }
-
-  HGresult st = hgMemGetHandleForAddressRange(
-    (void *)fd, (HGdeviceptr)addr, aligned_size,
-    HG_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
-  if (st == HGGC_SUCCESS) return ncclSuccess;
-
-  return ncclInvalidUsage;
+  return ncclHggcGetDmaBufFd(fd, addr, length);
 }
 
 // DMA-BUF MR registration. Returns ncclInvalidUsage if the DMA-BUF path

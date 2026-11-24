@@ -9,8 +9,8 @@
 #include "common.h"
 
 // size_t so GIN symmetric windows above 2GiB can be registered. NCCL is size_t throughout.
-ncclResult_t ncclIbRegMrInternal(void* comm, void* data, size_t size, int type, uint64_t mrFlags,
-                                 void** mhandle) {
+ncclResult_t ncclIbRegMrDmaBufInternal(void* comm, void* data, size_t size, int type, uint64_t offset,
+                                    int fd, uint64_t mrFlags, void** mhandle) {
   struct ncclIbNetCommBase* base = (struct ncclIbNetCommBase*)comm;
   struct ncclIbNetCommDevBase* devComm = ncclIbGetNetCommDevBase(base, 0);
   uintptr_t addr = (uintptr_t)data;
@@ -51,9 +51,14 @@ ncclResult_t ncclIbRegMrInternal(void* comm, void* data, size_t size, int type, 
   }
 
   struct ibv_mr* mr;
-  ncclResult_t result = relaxedOrdering
-    ? wrap_ibv_reg_mr_iova2(&mr, devComm->pd, (void*)regAddr, regSize, regAddr, flags)
-    : wrap_ibv_reg_mr(&mr, devComm->pd, (void*)regAddr, regSize, flags);
+  ncclResult_t result;
+  if (fd != -1) {
+    result = wrap_ibv_reg_dmabuf_mr(&mr, devComm->pd, offset, regSize, regAddr, fd, flags);
+  } else {
+    result = relaxedOrdering
+      ? wrap_ibv_reg_mr_iova2(&mr, devComm->pd, (void*)regAddr, regSize, regAddr, flags)
+      : wrap_ibv_reg_mr(&mr, devComm->pd, (void*)regAddr, regSize, flags);
+  }
   if (result != ncclSuccess) {
     if (cache->population == 0) {
       NCCLCHECK(ncclFree(cache->slots));
@@ -69,8 +74,18 @@ ncclResult_t ncclIbRegMrInternal(void* comm, void* data, size_t size, int type, 
   entry->refs = 1;
   entry->mr = mr;
   *mhandle = (void*)mr;
-  TRACE(NCCL_INIT,"regAddr %lx size %zu rkey %x", (unsigned long)regAddr, regSize, mr->rkey);
+  TRACE(NCCL_INIT|NCCL_NET,"regAddr %lx size %zu rkey %x fd %d", (unsigned long)regAddr, regSize, mr->rkey, fd);
   return ncclSuccess;
+}
+
+ncclResult_t ncclIbRegMrInternal(void* comm, void* data, size_t size, int type, uint64_t mrFlags,
+                                 void** mhandle) {
+  return ncclIbRegMrDmaBufInternal(comm, data, size, type, 0, -1, mrFlags, mhandle);
+}
+
+ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, uint64_t offset, int fd,
+                             void** mhandle) {
+  return ncclIbRegMrDmaBufInternal(comm, data, size, type, offset, fd, 0, mhandle);
 }
 
 // pcclNet_t entry point; the plugin ABI passes size as int. Larger callers use the size_t form.

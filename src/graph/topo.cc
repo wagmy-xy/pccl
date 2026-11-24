@@ -810,7 +810,9 @@ ncclResult_t ncclTopoGetSystem(ncclComm_t comm, struct ncclTopoSystem** system) 
     NCCLCHECKGOTO(xmlInitAttrInt(netNode, "port", props.port), res, fail);
     NCCLCHECKGOTO(xmlInitAttrUint64(netNode, "guid", props.guid), res, fail);
     NCCLCHECKGOTO(xmlInitAttrInt(netNode, "maxconn", props.maxComms), res, fail);
-    NCCLCHECKGOTO(xmlInitAttrInt(netNode, "gdr", props.ptrSupport & NCCL_PTR_HGGC ? 1 : 0), res, fail);
+    int gdrSupport = (props.ptrSupport & NCCL_PTR_HGGC) ||
+      (comm->dmaBufSupport && (props.ptrSupport & NCCL_PTR_DMABUF));
+    NCCLCHECKGOTO(xmlInitAttrInt(netNode, "gdr", gdrSupport), res, fail);
   }
 
   // hgml based group affinity settings before trim

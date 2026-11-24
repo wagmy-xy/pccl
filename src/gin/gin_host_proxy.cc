@@ -8,6 +8,8 @@
 
 #include <assert.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
 #include "pccl_internal.h"
 #include "gin/gin_host.h"
 #include "gin/gin_host_proxy.h"
@@ -83,21 +85,11 @@ static ncclResult_t getDmaBufFd(void *addr, size_t length, int *fd,
                                 bool forceNonDataDirect = false) {
   if (ncclParamDmaBufEnable() == 0) return ncclInvalidUsage;
 
-  static size_t hostPageSize = sysconf(_SC_PAGESIZE);
-  size_t alignedSize = length;
-  ALIGN_SIZE(alignedSize, hostPageSize);
-
   if (ncclParamIbDataDirect() && !forceNonDataDirect) {
-    HGresult status = hgMemGetHandleForAddressRange(
-      (void *)fd, (HGdeviceptr)addr, alignedSize, HG_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
-      HG_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE);
-    if (status == HGGC_SUCCESS) return ncclSuccess;
+    ncclResult_t ret = ncclHggcGetDmaBufFd(fd, addr, length, HG_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE);
+    if (ret == ncclSuccess) return ret;
   }
-  HGresult status = hgMemGetHandleForAddressRange((void *)fd, (HGdeviceptr)addr, alignedSize,
-                                                  HG_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
-  if (status == HGGC_SUCCESS) return ncclSuccess;
-
-  return ncclInvalidUsage;
+  return ncclHggcGetDmaBufFd(fd, addr, length);
 }
 
 static ncclResult_t proxyGinPollCompletions(void *collComm,
@@ -381,14 +373,14 @@ static ncclResult_t ncclGinProxyRegMrSym(void* ginCtx, void* addr, size_t size, 
     NCCLCHECK(ginBackend->regMrSym(cComm->collComm, addr, size, type, mrFlags, mhandle, ginHandle));
   } else if (type == NCCL_PTR_HGGC) {
     ncclResult_t dmabufResult = ncclInvalidUsage;
-    if (ncclParamDmaBufEnable() && (cComm->props.ptrSupport & NCCL_PTR_DMABUF)) {
+    if (ncclParamDmaBufEnable() && (cComm->props.ptrSupport & NCCL_PTR_DMABUF) && ginBackend->regMrSymDmaBuf) {
       ncclResult_t registrationResult = ncclSuccess;
       int dmabufFd = -1;
       dmabufResult = getDmaBufFd(addr, size, &dmabufFd);
       if (dmabufResult == ncclSuccess) {
         registrationResult = ginBackend->regMrSymDmaBuf(cComm->collComm, addr, size, type, 0, dmabufFd,
                                                      mrFlags, mhandle, ginHandle);
-        close(dmabufFd);
+        if (close(dmabufFd) != 0) WARN("GIN: DMA-BUF close failed: %s", strerror(errno));
       }
       if (registrationResult != ncclSuccess) {
         // This code path assumes if one MR enters this path, all others will too.
@@ -396,13 +388,14 @@ static ncclResult_t ncclGinProxyRegMrSym(void* ginCtx, void* addr, size_t size, 
         dmabufFd = -1;
         dmabufResult = getDmaBufFd(addr, size, &dmabufFd, true);
         if (dmabufResult == ncclSuccess) {
-          NCCLCHECK(ginBackend->regMrSymDmaBuf(cComm->collComm, addr, size, type, 0, dmabufFd,
-                                            mrFlags, mhandle, ginHandle));
-          close(dmabufFd);
+          registrationResult = ginBackend->regMrSymDmaBuf(cComm->collComm, addr, size, type, 0, dmabufFd,
+                                                       mrFlags, mhandle, ginHandle);
+          if (close(dmabufFd) != 0) WARN("GIN: DMA-BUF close failed: %s", strerror(errno));
+          NCCLCHECK(registrationResult);
         }
       }
     }
-    // Fallback to non-DMA-BUF if the DMA-BUF handle is not supported
+    // Preserve peer-memory fallback when DMA-BUF export is unavailable.
     if (dmabufResult != ncclSuccess) {
       NCCLCHECK(ginBackend->regMrSym(cComm->collComm, addr, size, type, mrFlags, mhandle, ginHandle));
     }

@@ -808,7 +808,9 @@ ib_recv:
   if (ncclParamIbUseInline()) rComm->remCtsFifo.flags = IBV_SEND_INLINE;
 
   // Allocate Flush dummy buffer for GPU Direct RDMA
-  rComm->gpuFlush.enabled = (ncclIbGdrSupport() == 0) && (ncclParamIbGdrFlushDisable() == 0) ? 1 : 0;
+  rComm->gpuFlush.enabled = ((ncclIbGdrSupport() == ncclSuccess ||
+                             ncclIbDmaBufSupport(lComm->dev) == ncclSuccess) &&
+                            ncclParamIbGdrFlushDisable() == 0) ? 1 : 0;
   rComm->gpuFlush.useWrite = pcclParamIbGdrFlushWrite();
   if (rComm->gpuFlush.enabled) {
     int flushReadDepth = 1;

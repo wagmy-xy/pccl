@@ -16,6 +16,7 @@
 
 #define NCCL_PTR_HOST 0x1
 #define NCCL_PTR_HGGC 0x2
+#define NCCL_PTR_DMABUF 0x4
 
 // Maximum number of requests per comm object
 #define NCCL_NET_MAX_REQUESTS 8

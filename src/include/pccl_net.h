@@ -17,6 +17,7 @@
 
 #define PCCL_PTR_HOST 0x1
 #define PCCL_PTR_HGGC 0x2
+#define PCCL_PTR_DMABUF 0x4
 
 // Maximum number of requests per comm object
 #define PCCL_NET_MAX_REQUESTS 8

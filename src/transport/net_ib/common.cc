@@ -143,16 +143,6 @@ ncclResult_t ncclIbGetPhysProperties(int dev, ncclNetProperties_t* props) {
   return ncclIbGetProperties(dev, props);
 }
 
-ncclResult_t ncclIbRegMrDmaBufInternal(void* comm, void* data, size_t size, int type, uint64_t /*offset*/,
-                                       int fd, uint64_t mrFlags, void** mhandle) {
-  if (fd != -1) {
-    WARN("NET/IB: DMA-BUF MR registration is not supported");
-    return ncclSystemError;
-  }
-  // GIN symmetric windows can exceed 2GiB, so keep the size in size_t.
-  return ncclIbRegMrInternal(comm, data, size, type, mrFlags, mhandle);
-}
-
 ncclNet_t ncclNetIb = {
         "IB",
         ncclIbInit,
@@ -162,7 +152,7 @@ ncclNet_t ncclNetIb = {
         ncclIbConnect,
         ncclIbAccept,
         ncclIbRegMr,
-        NULL,
+        ncclIbRegMrDmaBuf,
         ncclIbDeregMr,
         ncclIbIsend,
         ncclIbIrecv,

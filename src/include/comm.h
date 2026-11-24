@@ -656,6 +656,7 @@ struct pcclComm {
 
   // Backend and allocation modes selected for this communicator.
   ncclNet_t* ncclNet;
+  bool dmaBufSupport;
   int useU2mmHost;
   int useU2mmDev;
 

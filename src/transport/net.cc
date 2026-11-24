@@ -16,6 +16,9 @@
 #include "shm.h"
 #include "p2p.h"
 #include "profiler.h"
+#include "cudawrap.h"
+#include <errno.h>
+#include <unistd.h>
 
 // EIC plugins resolve these variables with dlsym.
 __attribute__((visibility("default"))) int nccl_use_u2mm_host = 0;
@@ -116,6 +119,7 @@ struct sendResources {
   int tpRemoteRank;
   int netDev;
   int useGdr;
+  int useDmaBuf;
   int maxRecvs;
   uint64_t* gdcSync;
   void* gdrDesc;
@@ -148,6 +152,7 @@ struct recvResources {
   int tpRemoteProxyRank;
   int netDev;
   int useGdr;
+  int useDmaBuf;
   int maxRecvs;
   uint64_t* gdcSync;
   uint64_t* gdcFlush;
@@ -657,6 +662,7 @@ static ncclResult_t sendProxySetup(struct ncclProxyConnection* connection, struc
   resources->u2mmMkeyPtr = NULL;
   ncclNetProperties_t props;
   NCCLCHECK(proxyState->ncclNet->getProperties(req->netDev, &props));
+  resources->useDmaBuf = resources->useGdr && proxyState->dmaBufSupport && (props.ptrSupport & NCCL_PTR_DMABUF);
   resources->maxRecvs = props.maxRecvs;
 
   // We don't return any data
@@ -685,6 +691,7 @@ static ncclResult_t recvProxySetup(struct ncclProxyConnection* connection, struc
   resources->connIndex = req->connIndex;
   ncclNetProperties_t props;
   NCCLCHECK(proxyState->ncclNet->getProperties(req->netDev, &props));
+  resources->useDmaBuf = resources->useGdr && proxyState->dmaBufSupport && (props.ptrSupport & NCCL_PTR_DMABUF);
   resources->maxRecvs = props.maxRecvs;
 
   if (respSize != sizeof(ncclNetHandle_t)) return ncclInternalError;
@@ -862,7 +869,18 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
       continue;
     }
     if (resources->buffers[p]) {
-      NCCLCHECK(proxyState->ncclNet->regMr(resources->netSendComm, resources->buffers[p], resources->buffSizes[p], NCCL_NET_MAP_DEV_MEM(map, buffs[p]) ? NCCL_PTR_HGGC : NCCL_PTR_HOST, &resources->mhandles[p]));
+      int type = NCCL_NET_MAP_DEV_MEM(map, buffs[p]) ? NCCL_PTR_HGGC : NCCL_PTR_HOST;
+      if (type == NCCL_PTR_HGGC && resources->useDmaBuf) {
+        int fd = -1;
+        NCCLCHECK(ncclHggcGetDmaBufFd(&fd, resources->buffers[p], resources->buffSizes[p]));
+        ncclResult_t ret = proxyState->ncclNet->regMrDmaBuf(resources->netSendComm, resources->buffers[p],
+          resources->buffSizes[p], type, 0, fd, &resources->mhandles[p]);
+        if (close(fd) != 0) WARN("NET: DMA-BUF close failed: %s", strerror(errno));
+        NCCLCHECK(ret);
+      } else {
+        NCCLCHECK(proxyState->ncclNet->regMr(resources->netSendComm, resources->buffers[p],
+          resources->buffSizes[p], type, &resources->mhandles[p]));
+      }
     }
   }
 
@@ -1052,7 +1070,18 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
       continue;
     }
     if (resources->buffers[p]) {
-      NCCLCHECK(proxyState->ncclNet->regMr(resources->netRecvComm, resources->buffers[p], resources->buffSizes[p], NCCL_NET_MAP_DEV_MEM(map, buffs[p]) ? NCCL_PTR_HGGC : NCCL_PTR_HOST, &resources->mhandles[p]));
+      int type = NCCL_NET_MAP_DEV_MEM(map, buffs[p]) ? NCCL_PTR_HGGC : NCCL_PTR_HOST;
+      if (type == NCCL_PTR_HGGC && resources->useDmaBuf) {
+        int fd = -1;
+        NCCLCHECK(ncclHggcGetDmaBufFd(&fd, resources->buffers[p], resources->buffSizes[p]));
+        ncclResult_t ret = proxyState->ncclNet->regMrDmaBuf(resources->netRecvComm, resources->buffers[p],
+          resources->buffSizes[p], type, 0, fd, &resources->mhandles[p]);
+        if (close(fd) != 0) WARN("NET: DMA-BUF close failed: %s", strerror(errno));
+        NCCLCHECK(ret);
+      } else {
+        NCCLCHECK(proxyState->ncclNet->regMr(resources->netRecvComm, resources->buffers[p],
+          resources->buffSizes[p], type, &resources->mhandles[p]));
+      }
     }
   }
 

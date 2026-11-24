@@ -14,6 +14,7 @@
 #include "transport.h"
 #include "group.h"
 #include "net.h"
+#include "cudawrap.h"
 #include "enqueue.h"
 #include "ce_coll.h"
 #include "p2p_dma.h"
@@ -599,6 +600,15 @@ NCCL_PARAM(GdrCopyFifoEnable, "GDRCOPY_FIFO_ENABLE", 1);
 #define NCCL_WORK_FIFO_BYTES_DEFAULT (1<<25)
 NCCL_PARAM(WorkFifoBytes, "WORK_FIFO_BYTES", NCCL_WORK_FIFO_BYTES_DEFAULT);
 NCCL_PARAM(WorkArgsBytes, "WORK_ARGS_BYTES", INT64_MAX);
+NCCL_PARAM(DmaBufEnable, "DMABUF_ENABLE", 1);
+
+static ncclResult_t dmaBufSupported(ncclComm_t comm) {
+  if (ncclParamDmaBufEnable() == 0 || comm->ncclNet->regMrDmaBuf == NULL ||
+      ncclHggcLibraryInit() != ncclSuccess) return ncclInternalError;
+  if (!ncclHggcDmaBufSupported(comm->hggcDev)) return ncclInternalError;
+  INFO(NCCL_INIT, "DMA-BUF is available on PPU device %d", comm->hggcDev);
+  return ncclSuccess;
+}
 
 ncclResult_t ncclCommEnsureReady(ncclComm_t comm) {
   /* comm must be ready, or error will be reported */
@@ -694,6 +704,7 @@ static ncclResult_t commAlloc(ncclComm_t comm, ncclComm_t parentComm, int ndev, 
   VERBOSE(NCCL_INIT,"comm %p rank %d nranks %d hggcDev %d busId %x compCap %d ppuType %s icnRmtType %s", comm, rank, ndev, comm->hggcDev, comm->busId, comm->compCap, ppuTypeStr[comm->ppuType], icnRmtTypeStr[comm->icnRmtType]);
 
   comm->checkPointers = ncclParamCheckPointers() == 1 ? true : false;
+  comm->dmaBufSupport = dmaBufSupported(comm) == ncclSuccess;
 
   comm->hostDevComm.comm.abortFlag = comm->abortFlagDev;
 
