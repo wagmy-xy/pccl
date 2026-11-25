@@ -244,9 +244,6 @@ struct ncclIbSendComm {
     struct ncclIbRequest* fifoReqs[NET_IB_MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
 
     struct ibv_mr* fifoMr;
-    int sizesFifo[NET_IB_MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
-    struct ibv_mr* sizesFifoMr;
-    struct ibv_sge sizesSge;
     uint64_t remSizesFifoAddr;
     uint32_t remSizesFifoRkey;
     int netDev;

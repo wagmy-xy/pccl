@@ -62,21 +62,21 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
 
   uint32_t immData = nreqs == 1 ? reqs[0]->send.size : 0;
   bool sendSizes = nreqs > 1 || comm->base.recvMatchingScheme == BY_ID;
+  int sizes[NCCL_NET_IB_MAX_RECVS];
+  struct ibv_sge sizesSge = {};
 
   struct ibv_send_wr* lastWr = comm->wrs + nreqs - 1;
   if (sendSizes || (!comm->base.oooRq && comm->ar && reqs[0]->send.size > ncclIbArThreshold)) {
     lastWr++;
     memset(lastWr, 0, sizeof(struct ibv_send_wr));
     if (sendSizes) {
-      // Keep the sizes row owned by a live request until every QP completes.
-      int sizesSlot = reqs[0] - comm->base.reqs;
-      for (int r = 0; r < nreqs; r++) comm->sizesFifo[sizesSlot][r] = reqs[r]->send.size;
-      comm->sizesSge.addr = (uint64_t)comm->sizesFifo[sizesSlot];
-      comm->sizesSge.length = nreqs * sizeof(int);
-      comm->sizesSge.lkey = comm->sizesFifoMr->lkey;
-      lastWr->sg_list = &comm->sizesSge;
+      // Inline payloads are copied by post_send, so stack storage needs no registration.
+      for (int r = 0; r < nreqs; r++) sizes[r] = reqs[r]->send.size;
+      sizesSge.addr = (uint64_t)sizes;
+      sizesSge.length = nreqs * sizeof(int);
+      lastWr->sg_list = &sizesSge;
       lastWr->num_sge = 1;
-      lastWr->wr.rdma.remote_addr = comm->remSizesFifoAddr + slots[0].reqIdx * sizeof(comm->sizesFifo[0]);
+      lastWr->wr.rdma.remote_addr = comm->remSizesFifoAddr + slots[0].reqIdx * sizeof(sizes);
       lastWr->wr.rdma.rkey = comm->remSizesFifoRkey;
     }
   }
@@ -88,7 +88,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
     lastWr->imm_data = immData;
   }
   lastWr->next = NULL;
-  lastWr->send_flags = IBV_SEND_SIGNALED;
+  lastWr->send_flags = IBV_SEND_SIGNALED | (sendSizes ? IBV_SEND_INLINE : 0);
 
   // Multi-QP: make sure IB writes are multiples of 128B so that LL and LL128 protocols still work
   const int align = 128;

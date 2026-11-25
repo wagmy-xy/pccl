@@ -334,10 +334,10 @@ ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum,
 
 ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* commDevBase, int access_flags,
                             int oooRq, struct ibv_qp** qp, void* qp_context) {
-  // TROCE GIN flush write needs inline room for the address header and flag.
-  const uint32_t inlineSize =
+  // Length notifications always need inline room, even when inline CTS is disabled.
+  const uint32_t inlineSize = std::max(sizeof(int) * NCCL_NET_IB_MAX_RECVS,
       (ncclParamIbUseInline() || ncclIbDevs[commDevBase->ibDevN].ibProvider == IB_PROVIDER_TROCE)
-          ? sizeof(struct ncclIbSendFifo) : 0;
+          ? sizeof(struct ncclIbSendFifo) : size_t(0));
   if (oooRq) {
     struct ibv_qp_init_attr_ex qpInitAttr;
     struct mlx5dv_qp_init_attr mlx5QpInitAttr;
@@ -609,8 +609,6 @@ ib_connect_check:
                                 IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_REMOTE_READ), res, fail);
   meta.fifoRkey = comm->fifoMr->rkey;
   meta.fifoAddr = (uint64_t)comm->ctsFifo;
-  NCCLCHECKGOTO(wrap_ibv_reg_mr(&comm->sizesFifoMr, comm->dev.base.pd, comm->sizesFifo,
-                                sizeof(comm->sizesFifo), IBV_ACCESS_LOCAL_WRITE), res, fail);
   meta.oooRqSize = ncclIbGetOooRqSize(dev);
 
   // Register a small scratchpad MR that the GIN proxy iputSignal path uses as
@@ -964,7 +962,6 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
     for (int q=0; q<comm->base.nqps; q++)
       if (comm->base.qps[q] != NULL) NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q]));
     if (comm->fifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->fifoMr));
-    if (comm->sizesFifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->sizesFifoMr));
     if (commDev->putSignalScratchpadMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->putSignalScratchpadMr));
     NCCLCHECK(ncclIbDestroyBase(&commDev->base));
     NCCLCHECK(ncclFree(comm));
