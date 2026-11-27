@@ -44,6 +44,7 @@ Common options:
 --cpu_num N        Number of parallel build jobs (default: auto)
 --examples         Also build examples after building the library
 --enable_tests     Also build test suites (graph_search_test, unit_test)
+--net_profiler     Enable built-in IB/Socket profiler events (default: disabled)
 ```
 
 The build places `libpccl.so` in `build/lib/` and public headers in `build/include/`.

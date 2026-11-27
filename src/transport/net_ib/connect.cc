@@ -951,6 +951,9 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   struct ncclIbSendCommDev* commDev = &comm->dev;
   if (comm) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+    for (int i = 0; i < NET_IB_MAX_REQUESTS; i++) NCCLCHECK(ncclIbFreeRequest(comm->base.reqs + i));
+#endif
     NCCLCHECK(ncclSocketClose(&comm->base.sock));
     for (int q=0; q<comm->base.nqps; q++)
       if (comm->base.qps[q] != NULL) NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q]));
@@ -966,6 +969,9 @@ ncclResult_t ncclIbCloseRecv(void* recvComm) {
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
   struct ncclIbRecvCommDev* commDev = &comm->dev;
   if (comm) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+    for (int i = 0; i < NET_IB_MAX_REQUESTS; i++) NCCLCHECK(ncclIbFreeRequest(comm->base.reqs + i));
+#endif
     NCCLCHECK(ncclSocketClose(&comm->base.sock));
     for (int q=0; q<comm->base.nqps; q++)
       if (comm->base.qps[q] != NULL) NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q]));

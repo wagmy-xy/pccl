@@ -11,6 +11,7 @@
 #include "socket.h"
 #include "net.h"
 #include "param.h"
+#include "net_profiler.h"
 
 #include <assert.h>
 #include <pthread.h>
@@ -150,8 +151,12 @@ struct ncclNetSocketTask {
   int size;
   struct ncclSocket* sock;
   int offset;
-  int used;
+  int used; // 0: free, 1: active, 2: complete
   ncclResult_t result;
+#ifdef NCCL_ENABLE_NET_PROFILING
+  void* pHandle;
+  void* eHandle;
+#endif
 };
 
 struct ncclNetSocketRequest {
@@ -165,6 +170,10 @@ struct ncclNetSocketRequest {
   struct ncclNetSocketComm* comm;
   struct ncclNetSocketTask* tasks[MAX_SOCKETS];
   int nSubs;
+#ifdef NCCL_ENABLE_NET_PROFILING
+  void* pHandle;
+  void* eHandle;
+#endif
 };
 
 struct ncclNetSocketTaskQueue {
@@ -205,6 +214,19 @@ struct ncclNetSocketComm {
   struct ncclNetSocketThreadResources threadResources[MAX_THREADS];
 };
 
+#ifdef NCCL_ENABLE_NET_PROFILING
+static ncclResult_t ncclNetSocketProfilerStart(void** handle, void* parent, struct ncclSocket* sock,
+                                             int op, int size) {
+  ncclProfilerNetSockDescr_v1_t data = {};
+  data.type = ncclProfileSocket;
+  data.sock.fd = sock->fd;
+  data.sock.op = op;
+  data.sock.length = size;
+  return pcclProfilerNetStart(handle, parent,
+                            NCCL_PROFILER_NET_TYPE_SOCK | NCCL_PROFILER_NET_SOCKET_VER, &data);
+}
+#endif
+
 static ncclResult_t ncclNetSocketInitInlineData(struct ncclNetSocketComm* comm) {
   int64_t inlineSize = ncclParamSocketInlineSize();
   int64_t minTaskSize = ncclParamSocketMinTaskSize();
@@ -226,33 +248,54 @@ void* persistentSocketThread(void *args_) {
   int nSocksPerThread = comm->nSocks / comm->nThreads;
   while (1) {
     int idle = 1;
-    int mark = myQueue->next; // mark newest task seen
+    int mark = __atomic_load_n(&myQueue->next, __ATOMIC_ACQUIRE); // mark newest task seen
     for (int i=0; i<myQueue->len; i+=nSocksPerThread) {
       int repeat;
       do {
         repeat = 0;
         for (int j=0; j<nSocksPerThread; j++) {
+          if (__atomic_load_n(&resource->stop, __ATOMIC_ACQUIRE)) return NULL;
           struct ncclNetSocketTask* r = myQueue->tasks+i+j;
-          if (r != NULL && r->used == 1 && r->offset < r->size) {
-            r->result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &r->offset);
-            if (r->result != ncclSuccess) {
+          // One helper owns this queue. State 2 publishes completion; the producer
+          // may recycle a slot only after observing that state with acquire ordering.
+          if (__atomic_load_n(&r->used, __ATOMIC_ACQUIRE) == 1) {
+            int offset = r->offset;
+            ncclResult_t result = ncclSuccess;
+#ifdef NCCL_ENABLE_NET_PROFILING
+            result = ncclNetSocketProfilerStart(&r->eHandle, r->pHandle, r->sock, r->op, r->size);
+#endif
+            if (result == ncclSuccess) result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &offset);
+#ifdef NCCL_ENABLE_NET_PROFILING
+            if (result != ncclSuccess || offset == r->size) {
+              ncclResult_t stopResult = pcclProfilerNetStop(&r->eHandle);
+              if (result == ncclSuccess) result = stopResult;
+            }
+#endif
+            r->result = result;
+            if (result != ncclSuccess) {
+              __atomic_store_n(&r->used, 2, __ATOMIC_RELEASE);
               WARN("NET/Socket : socket progress error");
               return NULL;
             }
+            // Retire the network event before publishing completion and allowing the parent step to be reused.
+            bool pending = offset < r->size;
+            r->offset = offset;
+            __atomic_store_n(&r->used, pending ? 1 : 2, __ATOMIC_RELEASE);
             idle = 0;
-            if (r->offset < r->size) repeat = 1;
+            if (pending) repeat = 1;
           }
         }
       } while (repeat);
     }
     if (idle) {
       pthread_mutex_lock(&resource->threadLock);
-      while (mark == myQueue->next && resource->stop == 0) { // no new tasks, wait
+      while (mark == __atomic_load_n(&myQueue->next, __ATOMIC_ACQUIRE) &&
+             __atomic_load_n(&resource->stop, __ATOMIC_ACQUIRE) == 0) { // no new tasks, wait
         pthread_cond_wait(&resource->threadCond, &resource->threadLock);
       }
       pthread_mutex_unlock(&resource->threadLock);
     }
-    if (resource->stop) return NULL;
+    if (__atomic_load_n(&resource->stop, __ATOMIC_ACQUIRE)) return NULL;
   }
 }
 
@@ -480,6 +523,10 @@ ncclResult_t ncclNetSocketGetRequest(struct ncclNetSocketComm* comm, int op, voi
       r->used = 1;
       r->comm = comm;
       r->nSubs = 0;
+#ifdef NCCL_ENABLE_NET_PROFILING
+      r->pHandle = nullptr;
+      r->eHandle = nullptr;
+#endif
       *req = r;
       return ncclSuccess;
     }
@@ -488,7 +535,8 @@ ncclResult_t ncclNetSocketGetRequest(struct ncclNetSocketComm* comm, int op, voi
   return ncclInternalError;
 }
 
-ncclResult_t ncclNetSocketGetTask(struct ncclNetSocketComm* comm, int op, void* data, int size, struct ncclNetSocketTask** req) {
+ncclResult_t ncclNetSocketGetTask(struct ncclNetSocketComm* comm, int op, void* data, int size,
+                                struct ncclNetSocketTask** req, void* phandle = nullptr) {
   int tid = comm->nextSock % comm->nThreads;
   struct ncclNetSocketThreadResources* res = comm->threadResources+tid;
   struct ncclNetSocketTaskQueue* queue = &res->threadTaskQueue;
@@ -503,22 +551,27 @@ ncclResult_t ncclNetSocketGetTask(struct ncclNetSocketComm* comm, int op, void* 
     res->comm = comm;
     pthread_mutex_init(&res->threadLock, NULL);
     pthread_cond_init(&res->threadCond, NULL);
-    pthread_create(comm->helperThread+tid, NULL, persistentSocketThread, res);
+    PTHREADCHECK(pthread_create(comm->helperThread+tid, NULL, persistentSocketThread, res), "pthread_create");
     ncclSetThreadName(comm->helperThread[tid], "PCCL Sock%c%1u%2u%2u", op == NCCL_SOCKET_SEND ? 'S' : 'R', comm->dev, tid, comm->hggcDev);
   }
   struct ncclNetSocketTask* r = queue->tasks+queue->next;
-  if (r->used == 0) {
+  if (__atomic_load_n(&r->used, __ATOMIC_ACQUIRE) == 0) {
     r->op = op;
     r->data = data;
     r->size = size;
     r->sock = comm->socks + comm->nextSock;
     r->offset = 0;
     r->result = ncclSuccess;
+#ifdef NCCL_ENABLE_NET_PROFILING
+    // Associate each task with its request, rather than with the first request on this helper thread.
+    r->pHandle = phandle;
+    r->eHandle = nullptr;
+#endif
     comm->nextSock = (comm->nextSock + 1) % comm->nSocks;
-    r->used = 1;
+    __atomic_store_n(&r->used, 1, __ATOMIC_RELEASE);
     *req = r;
     pthread_mutex_lock(&res->threadLock);
-    queue->next = (queue->next+1)%queue->len;
+    __atomic_store_n(&queue->next, (queue->next+1)%queue->len, __ATOMIC_RELEASE);
     pthread_cond_signal(&res->threadCond);
     pthread_mutex_unlock(&res->threadLock);
     return ncclSuccess;
@@ -586,7 +639,12 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       int taskSize = std::max(r->comm->minTaskSize, remaining / r->comm->nSocks + (remaining % r->comm->nSocks != 0));
       while (chunkOffset < r->size) {
         int chunkSize = std::min(taskSize, r->size-chunkOffset);
-        NCCLCHECK(ncclNetSocketGetTask(r->comm, r->op, (char*)(r->data)+chunkOffset, chunkSize, r->tasks+i++));
+        void* phandle = nullptr;
+#ifdef NCCL_ENABLE_NET_PROFILING
+        phandle = r->pHandle;
+#endif
+        NCCLCHECK(ncclNetSocketGetTask(r->comm, r->op, (char*)(r->data)+chunkOffset,
+                                     chunkSize, r->tasks+i++, phandle));
         chunkOffset += chunkSize;
       }
     }
@@ -597,8 +655,10 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
       int nCompleted = 0;
       for (int i=0; i<r->nSubs; i++) {
         struct ncclNetSocketTask* sub = r->tasks[i];
-        if (sub->result != ncclSuccess) return sub->result;
-        if (sub->offset == sub->size) nCompleted++;
+        if (__atomic_load_n(&sub->used, __ATOMIC_ACQUIRE) == 2) {
+          if (sub->result != ncclSuccess) return sub->result;
+          if (sub->offset == sub->size) nCompleted++;
+        }
       }
       if (nCompleted == r->nSubs) {
         if (size) *size = r->size;
@@ -606,14 +666,26 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
         r->used = 0;
         for (int i=0; i<r->nSubs; i++) {
           struct ncclNetSocketTask* sub = r->tasks[i];
-          sub->used = 0;
+          __atomic_store_n(&sub->used, 0, __ATOMIC_RELEASE);
         }
       }
     } else { // progress request using main thread
+#ifdef NCCL_ENABLE_NET_PROFILING
+      NCCLCHECK(ncclNetSocketProfilerStart(&r->eHandle, r->pHandle, r->ctrlSock, r->op, r->size));
+#endif
       if (r->offset < r->size) {
-        NCCLCHECK(ncclSocketProgress(r->op, r->ctrlSock, r->data, r->size, &r->offset));
+        ncclResult_t result = ncclSocketProgress(r->op, r->ctrlSock, r->data, r->size, &r->offset);
+        if (result != ncclSuccess) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+          NCCLCHECK(pcclProfilerNetStop(&r->eHandle));
+#endif
+          return result;
+        }
       }
       if (r->offset == r->size) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+        NCCLCHECK(pcclProfilerNetStop(&r->eHandle));
+#endif
         if (size) *size = r->size;
         *done = 1;
         r->used = 0;
@@ -634,6 +706,15 @@ ncclResult_t ncclNetSocketIsend(void* sendComm, void* data, int size, int tag, v
   return ncclSuccess;
 }
 
+#ifdef NCCL_ENABLE_NET_PROFILING
+ncclResult_t ncclNetSocketIsend(void* sendComm, void* data, int size, int tag, void* mhandle,
+                              void* phandle, void** request) {
+  NCCLCHECK(ncclNetSocketIsend(sendComm, data, size, tag, mhandle, request));
+  ((struct ncclNetSocketRequest*)*request)->pHandle = phandle;
+  return ncclSuccess;
+}
+#endif
+
 ncclResult_t ncclNetSocketIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
   struct ncclNetSocketComm* comm = (struct ncclNetSocketComm*)recvComm;
   if (n != 1) return ncclInternalError;
@@ -645,6 +726,15 @@ ncclResult_t ncclNetSocketIflush(void* recvComm, int n, void** data, int* sizes,
   // We don't support hggc pointers, so we don't need a flush operation
   return ncclInternalError;
 }
+
+#ifdef NCCL_ENABLE_NET_PROFILING
+ncclResult_t ncclNetSocketIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles,
+                              void** phandles, void** request) {
+  NCCLCHECK(ncclNetSocketIrecv(recvComm, n, data, sizes, tags, mhandles, request));
+  ((struct ncclNetSocketRequest*)*request)->pHandle = phandles ? phandles[0] : nullptr;
+  return ncclSuccess;
+}
+#endif
 
 ncclResult_t ncclNetSocketCloseListen(void* opaqueComm) {
   struct ncclNetSocketListenComm* comm = (struct ncclNetSocketListenComm*)opaqueComm;
@@ -664,14 +754,20 @@ ncclResult_t ncclNetSocketClose(void* opaqueComm) {
       struct ncclNetSocketThreadResources* res = comm->threadResources+i;
       if (comm->helperThread[i]) {
         pthread_mutex_lock(&res->threadLock);
-        res->stop = 1;
+        __atomic_store_n(&res->stop, 1, __ATOMIC_RELEASE);
         pthread_cond_signal(&res->threadCond);
         pthread_mutex_unlock(&res->threadLock);
-        pthread_join(comm->helperThread[i], NULL);
+        PTHREADCHECK(pthread_join(comm->helperThread[i], NULL), "pthread_join");
       }
       struct ncclNetSocketTaskQueue* queue = &res->threadTaskQueue;
+#ifdef NCCL_ENABLE_NET_PROFILING
+      for (int j = 0; j < queue->len; j++) NCCLCHECK(pcclProfilerNetStop(&queue->tasks[j].eHandle));
+#endif
       NCCLCHECK(ncclFree(queue->tasks));
     }
+#ifdef NCCL_ENABLE_NET_PROFILING
+    for (int i = 0; i < MAX_REQUESTS; i++) NCCLCHECK(pcclProfilerNetStop(&comm->requests[i].eHandle));
+#endif
     int ready;
     NCCLCHECK(ncclSocketReady(&comm->ctrlSock, &ready));
     if (ready) NCCLCHECK(ncclSocketClose(&comm->ctrlSock));

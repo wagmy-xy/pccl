@@ -31,4 +31,30 @@ ncclResult_t ncclGpuGdrSupport(int* gdrSupport);
 extern ncclNet_t ncclNetIb;
 extern ncclNet_t ncclNetSocket;
 
+#ifdef NCCL_ENABLE_NET_PROFILING
+// Internal overloads carry Proxy step handles without changing the NET v4/v5/v6 ABI.
+ncclResult_t ncclIbIsend(void*, void*, int, int, void*, void*, void**);
+ncclResult_t ncclIbIrecv(void*, int, void**, int*, int*, void**, void**, void**);
+ncclResult_t ncclNetSocketIsend(void*, void*, int, int, void*, void*, void**);
+ncclResult_t ncclNetSocketIrecv(void*, int, void**, int*, int*, void**, void**, void**);
+#endif
+
+static inline ncclResult_t pcclNetIsend(ncclNet_t* net, void* comm, void* data, int size, int tag,
+                                      void* mhandle, void* phandle, void** request) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+  if (net == &ncclNetIb) return ncclIbIsend(comm, data, size, tag, mhandle, phandle, request);
+  if (net == &ncclNetSocket) return ncclNetSocketIsend(comm, data, size, tag, mhandle, phandle, request);
+#endif
+  return net->isend(comm, data, size, tag, mhandle, request);
+}
+
+static inline ncclResult_t pcclNetIrecv(ncclNet_t* net, void* comm, int n, void** data, int* sizes, int* tags,
+                                      void** mhandles, void** phandles, void** request) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+  if (net == &ncclNetIb) return ncclIbIrecv(comm, n, data, sizes, tags, mhandles, phandles, request);
+  if (net == &ncclNetSocket) return ncclNetSocketIrecv(comm, n, data, sizes, tags, mhandles, phandles, request);
+#endif
+  return net->irecv(comm, n, data, sizes, tags, mhandles, request);
+}
+
 #endif

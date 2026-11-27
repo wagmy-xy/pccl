@@ -13,6 +13,40 @@
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", -2);
 int64_t ncclIbArThreshold = 8192;
 
+#ifdef NCCL_ENABLE_NET_PROFILING
+static ncclResult_t ncclIbProfilerStart(struct ncclIbRequest* req, struct ibv_qp* qp,
+                                      uint64_t wrId, int opcode, size_t length) {
+  int q = req->pInfo.nQps;
+  if (q >= NCCL_IB_MAX_QPS) return ncclInternalError;
+  req->pInfo.qpNums[q] = qp->qp_num;
+  req->pInfo.nQps++;
+  int n = req->type == NCCL_NET_IB_REQ_SEND ? 1 : req->nreqs;
+  for (int i = 0; i < n; i++) {
+    req->pInfo.handles[i][q] = nullptr;
+    ncclProfilerNetIbDescr_v1_t data = {};
+    data.type = ncclProfileQp;
+    data.qp.device = req->devBase->ibDevN;
+    data.qp.wr_id = wrId;
+    data.qp.opcode = opcode;
+    data.qp.qpNum = qp->qp_num;
+    data.qp.length = length;
+    NCCLCHECK(pcclProfilerNetStart(&req->pInfo.handles[i][q], req->pInfo.parents[i],
+                                 NCCL_PROFILER_NET_TYPE_IB | NCCL_PROFILER_NET_IB_VER, &data));
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclIbProfilerStop(struct ncclIbRequest* req, uint32_t qpNum, bool all = false) {
+  int n = req->type == NCCL_NET_IB_REQ_SEND ? 1 : req->nreqs;
+  if (req->type != NCCL_NET_IB_REQ_SEND && req->type != NCCL_NET_IB_REQ_RECV) return ncclSuccess;
+  for (int q = 0; q < req->pInfo.nQps; q++) {
+    if (!all && req->pInfo.qpNums[q] != qpNum) continue;
+    for (int i = 0; i < n; i++) NCCLCHECK(pcclProfilerNetStop(&req->pInfo.handles[i][q]));
+  }
+  return ncclSuccess;
+}
+#endif
+
 ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbRequest** req) {
   for (int i = 0; i < NET_IB_MAX_REQUESTS; i++) {
     struct ncclIbRequest* r = base->reqs + i;
@@ -20,6 +54,10 @@ ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbReque
       r->base = base;
       r->events = 1;
       r->sock = NULL;
+#ifdef NCCL_ENABLE_NET_PROFILING
+      r->pInfo.nQps = 0;
+      memset(r->pInfo.parents, 0, sizeof(r->pInfo.parents));
+#endif
       *req = r;
       return ncclSuccess;
     }
@@ -29,6 +67,9 @@ ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbReque
   return ncclInternalError;
 }
 ncclResult_t ncclIbFreeRequest(struct ncclIbRequest* r) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+  NCCLCHECK(ncclIbProfilerStop(r, 0, true));
+#endif
   r->type = NCCL_NET_IB_REQ_UNUSED;
   return ncclSuccess;
 }
@@ -118,7 +159,19 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       }
     }
     struct ibv_send_wr* bad_wr;
-    NCCLCHECK(wrap_ibv_post_send(comm->base.qps[comm->base.qpIndex], comm->wrs, &bad_wr));
+#ifdef NCCL_ENABLE_NET_PROFILING
+    for (int r = 0; r < nreqs; r++) {
+      NCCLCHECK(ncclIbProfilerStart(reqs[r], comm->base.qps[comm->base.qpIndex],
+                                  comm->wrs[r].wr_id, comm->wrs[r].opcode, comm->sges[r].length));
+    }
+#endif
+    ncclResult_t result = wrap_ibv_post_send(comm->base.qps[comm->base.qpIndex], comm->wrs, &bad_wr);
+    if (result != ncclSuccess) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+      for (int r = 0; r < nreqs; r++) NCCLCHECK(ncclIbProfilerStop(reqs[r], 0, true));
+#endif
+      return result;
+    }
     comm->base.qpIndex = (comm->base.qpIndex + 1) % comm->base.nqps;
 
     for (int r = 0; r < nreqs; r++) {
@@ -137,7 +190,12 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   return ncclSuccess;
 }
 
+#ifdef NCCL_ENABLE_NET_PROFILING
+ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle,
+                       void* phandle, void** request) {
+#else
 ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
+#endif
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm->base.ready == 0) {
     WARN("NET/IB: ncclIbIsend called before connection is ready");
@@ -189,6 +247,9 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
     req->send.data = data;
     req->send.lkey = mr->lkey;
     req->send.offset = 0;
+#ifdef NCCL_ENABLE_NET_PROFILING
+    req->pInfo.parents[0] = phandle;
+#endif
     req->events = ncclIbCommBaseGetNqpsPerRequest(&comm->base);
     *request = reqs[r] = req;
     TRACE(NCCL_NET, "NET/IB: %s: Send request created (req=%p, comm=%p, slot=%d, reqIdx=%d, nreqs=%d, tag=%x, size=%ld, data=0x%016" PRIx64 ")",
@@ -211,6 +272,12 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
   *request = NULL;
   return ncclSuccess;
 }
+
+#ifdef NCCL_ENABLE_NET_PROFILING
+ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
+  return ncclIbIsend(sendComm, data, size, tag, mhandle, nullptr, request);
+}
+#endif
 
 ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int* sizes, int* tags, void** mhandles, struct ncclIbRequest* req) {
   struct ibv_send_wr wr;
@@ -280,7 +347,12 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
   return ncclSuccess;
 }
 
+#ifdef NCCL_ENABLE_NET_PROFILING
+ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles,
+                       void** phandles, void** request) {
+#else
 ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+#endif
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
   if (comm->base.ready == 0) {
     WARN("NET/IB: ncclIbIrecv called before connection is ready");
@@ -298,6 +370,9 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
   req->type = NCCL_NET_IB_REQ_RECV;
   req->sock = &comm->base.sock;
   req->nreqs = n;
+#ifdef NCCL_ENABLE_NET_PROFILING
+  for (int i = 0; i < n; i++) req->pInfo.parents[i] = phandles ? phandles[i] : nullptr;
+#endif
   TRACE(NCCL_NET, "NET/IB: %s: Recv request created (req=%p, comm=%p, nreqs=%d, tag[0]=%x)",
         __func__, req, req->base, n, tags[0]);
 
@@ -316,7 +391,16 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
     for (int q = 0; q < nqps; q++) {
       struct ibv_qp* qp = comm->base.qps[comm->base.qpIndex];
       struct ibv_recv_wr* bad_wr;
-      NCCLCHECK(wrap_ibv_post_recv(qp, &wr, &bad_wr));
+#ifdef NCCL_ENABLE_NET_PROFILING
+      NCCLCHECK(ncclIbProfilerStart(req, qp, wr.wr_id, 0, 0));
+#endif
+      ncclResult_t result = wrap_ibv_post_recv(qp, &wr, &bad_wr);
+      if (result != ncclSuccess) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+        NCCLCHECK(ncclIbProfilerStop(req, 0, true));
+#endif
+        return result;
+      }
       comm->base.qpIndex = (comm->base.qpIndex + 1) % comm->base.nqps;
     }
   }
@@ -325,9 +409,21 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
   *request = req;
 
   // Post to FIFO to notify sender
-  NCCLCHECK(ncclIbPostFifo(comm, n, data, sizes, tags, mhandles, req));
+  ncclResult_t result = ncclIbPostFifo(comm, n, data, sizes, tags, mhandles, req);
+  if (result != ncclSuccess) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+    NCCLCHECK(ncclIbProfilerStop(req, 0, true));
+#endif
+    return result;
+  }
   return ncclSuccess;
 }
+
+#ifdef NCCL_ENABLE_NET_PROFILING
+ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+  return ncclIbIrecv(recvComm, n, data, sizes, tags, mhandles, nullptr, request);
+}
+#endif
 
 ncclResult_t ncclIbIflush(void* recvComm, int n, void** data, int* sizes, void** mhandles, void** request) {
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
@@ -415,6 +511,12 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
     for (int w = 0; w < wrDone; w++) {
       struct ibv_wc *wc = wcs + w;
       if (wc->status != IBV_WC_SUCCESS) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+        // A failed CQE aborts this connection; retire every live network event.
+        for (int i = 0; i < NET_IB_MAX_REQUESTS; i++) {
+          NCCLCHECK(ncclIbProfilerStop(r->base->reqs + i, 0, true));
+        }
+#endif
         union ncclSocketAddress addr;
         ncclSocketGetAddr(r->sock, &addr);
         WARN("NET/IB: %s: Got CQE with error (req=%p, comm=%p (%s), wr_id=%lu, qp_num=%d)",
@@ -431,6 +533,10 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
           struct ncclIbRequest* sendReq = r->base->reqs + ((wc->wr_id >> (i * 8)) & 0xff);
           if ((sendReq->events <= 0)) return ncclInternalError;
           sendReq->events--;
+#ifdef NCCL_ENABLE_NET_PROFILING
+          // Every send request in a multi-send uses its own first parent slot.
+          NCCLCHECK(ncclIbProfilerStop(sendReq, wc->qp_num));
+#endif
         }
       } else {
         struct ncclIbRecvComm* recvComm = container_of(r->base, struct ncclIbRecvComm, base);
@@ -458,6 +564,10 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
             int qpFound = 0;
             for (int q = 0; q < recvComm->base.nqps; q++) {
               if (recvComm->base.qps[q]->qp_num == wc->qp_num) {
+#ifdef NCCL_ENABLE_NET_PROFILING
+                // Shared preposted RQs have no logical parent until a BY_ID CQE identifies the request.
+                NCCLCHECK(ncclIbProfilerStart(req, recvComm->base.qps[q], req - req->base->reqs, 0, 0));
+#endif
                 struct ibv_recv_wr* badWorkRequest;
                 NCCLCHECK(wrap_ibv_post_recv(recvComm->base.qps[q], &recvComm->ibRecvWorkRequest,
                                               &badWorkRequest));
@@ -467,6 +577,10 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
             }
             if (!qpFound) return ncclInternalError;
           }
+#ifdef NCCL_ENABLE_NET_PROFILING
+          // CTS send completions and flush requests must not stop receive QP events.
+          NCCLCHECK(ncclIbProfilerStop(req, wc->qp_num));
+#endif
         }
         req->events--;
       }

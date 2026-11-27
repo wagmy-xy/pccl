@@ -734,7 +734,9 @@ __hidden ncclResult_t exampleProfilerStartEvent(void* context, void** eHandle, n
     if (type == NCCL_PROFILER_NET_TYPE_IB) {
       if (ver == 1) {
         ncclProfilerNetIbDescr_v1_t* descr = (ncclProfilerNetIbDescr_v1_t *)eDescr->netPlugin.data;
-        struct netPlugin* event = parent->net + __atomic_fetch_add(&parent->nNetEvents, 1, __ATOMIC_RELAXED);
+        int index = __atomic_fetch_add(&parent->nNetEvents, 1, __ATOMIC_RELAXED);
+        if (index >= MAX_EVENTS_PER_REQ) return ncclSuccess;
+        struct netPlugin* event = parent->net + index;
         event->type = ncclProfileNetPlugin;
         event->pluginType = type;
         event->pluginVer = ver;
@@ -753,7 +755,9 @@ __hidden ncclResult_t exampleProfilerStartEvent(void* context, void** eHandle, n
     } else if (type == NCCL_PROFILER_NET_TYPE_SOCK) {
       if (ver == 1) {
         ncclProfilerNetSockDescr_v1_t* descr = (ncclProfilerNetSockDescr_v1_t *)eDescr->netPlugin.data;
-        struct netPlugin* event = parent->net + __atomic_fetch_add(&parent->nNetEvents, 1, __ATOMIC_RELAXED);
+        int index = __atomic_fetch_add(&parent->nNetEvents, 1, __ATOMIC_RELAXED);
+        if (index >= MAX_EVENTS_PER_REQ) return ncclSuccess;
+        struct netPlugin* event = parent->net + index;
         event->type = ncclProfileNetPlugin;
         event->pluginType = type;
         event->pluginVer = ver;

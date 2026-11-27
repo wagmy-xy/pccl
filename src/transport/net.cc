@@ -1261,13 +1261,16 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           if (ready) {
             ncclProfilerRecordProxyStepEventState(s, args, transmittedStepId, ncclProfilerProxyStepSendPeerWait_v4);
             // Data is ready, try to send.
+            void* phandle = &sub->pHandles[DIVUP(transmittedStepId, args->sliceSteps) % NCCL_STEPS];
 #ifdef NET_BYPASS
             if (args->bypass)
               sub->requests[buffSlot] = &sub;
             else
-              NCCLCHECK(proxyState->ncclNet->isend(resources->netSendComm, buff, size, resources->tpRank, mhandle, sub->requests + buffSlot));
+              NCCLCHECK(pcclNetIsend(proxyState->ncclNet, resources->netSendComm, buff, size,
+                                    resources->tpRank, mhandle, phandle, sub->requests + buffSlot));
 #else
-            NCCLCHECK(proxyState->ncclNet->isend(resources->netSendComm, buff, size, resources->tpRank, mhandle, sub->requests + buffSlot));
+            NCCLCHECK(pcclNetIsend(proxyState->ncclNet, resources->netSendComm, buff, size,
+                                  resources->tpRank, mhandle, phandle, sub->requests + buffSlot));
 #endif
             if (sub->requests[buffSlot] != NULL) {
               TRACE(NCCL_NET, "sendProxy [%ld/%d/%d] Isend posted, req %p, buff %p, size %d, proto %d, myRank %d, channelId %d",
@@ -1375,6 +1378,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       int sizes[NCCL_PROXY_MAX_SUBS];
       int tags[NCCL_PROXY_MAX_SUBS];
       void* mhandles[NCCL_PROXY_MAX_SUBS];
+      void* phandles[NCCL_PROXY_MAX_SUBS];
 
       for (int i = 0; i < subGroup->groupSize; i++) {
         struct ncclProxySubArgs* sub = subGroup + i;
@@ -1401,6 +1405,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           if (sub->nbytes < sizes[subCount]) sizes[subCount] = sub->nbytes;
           tags[subCount] = resources->tpRemoteRank;
           mhandles[subCount] = resources->mhandles[p];
+          phandles[subCount] = &sub->pHandles[DIVUP(postedStepId, args->sliceSteps) % NCCL_STEPS];
           subCount++;
         }
       }
@@ -1413,9 +1418,11 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         if (args->bypass)
           requestPtr = (void**)&subGroup;
         else
-          NCCLCHECK(proxyState->ncclNet->irecv(resources->netRecvComm, subCount, ptrs, sizes, tags, mhandles, requestPtr));
+          NCCLCHECK(pcclNetIrecv(proxyState->ncclNet, resources->netRecvComm, subCount,
+                                ptrs, sizes, tags, mhandles, phandles, requestPtr));
 #else
-        NCCLCHECK(proxyState->ncclNet->irecv(resources->netRecvComm, subCount, ptrs, sizes, tags, mhandles, requestPtr));
+        NCCLCHECK(pcclNetIrecv(proxyState->ncclNet, resources->netRecvComm, subCount,
+                              ptrs, sizes, tags, mhandles, phandles, requestPtr));
 #endif
         if (*requestPtr) {
           for (int i = 0; i < subGroup->groupSize; i++) {

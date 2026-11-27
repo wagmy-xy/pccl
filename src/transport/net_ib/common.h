@@ -15,6 +15,7 @@
 #include "net.h"
 #include "utils.h"
 #include "param.h"
+#include "net_profiler.h"
 
 #include <assert.h>
 #include <pthread.h>
@@ -115,6 +116,15 @@ struct ncclIbRequest {
   struct ncclIbNetCommDevBase* devBase;
   struct ncclSocket* sock;
   int nreqs;
+#ifdef NCCL_ENABLE_NET_PROFILING
+  // A multi-recv has a distinct Proxy step parent for each constituent request.
+  struct {
+    void* parents[NCCL_NET_IB_MAX_RECVS];
+    void* handles[NCCL_NET_IB_MAX_RECVS][NCCL_IB_MAX_QPS];
+    uint32_t qpNums[NCCL_IB_MAX_QPS];
+    int nQps;
+  } pInfo;
+#endif
   union {
     struct {
     int size;

@@ -34,6 +34,7 @@ parser.add_argument('--bypass_mode', default=0, type=int, help="Enable bypass op
 parser.add_argument('--ppu_archs', default='ppu_10,ppu_15', type=str, help="Set ppu archs.")
 parser.add_argument('--hggcrt_version', default=12, type=int, help="HGGC runtime version.")
 parser.add_argument('--enable_tests', default=False, action='store_true', help="Enable tests.")
+parser.add_argument('--net_profiler', default=False, action='store_true', help="Enable built-in IB/Socket profiler events.")
 parser.add_argument('--no_tsm', default=False, action='store_true', help="Not using TSM to implement kernels.")
 parser.add_argument('--no_hgtx', default=False, action='store_true', help="Disable hgtx when compiling.")
 parser.add_argument('--no_ext_kernel', default=False, action='store_true', help="Skip building ext-kernel, ext-tuner, and ext-profiler plugins.")
@@ -63,6 +64,9 @@ function build_dir
     fi
     if [[ $TRACE ]]; then
         build_cmd_str="${build_cmd_str} TRACE=1"
+    fi
+    if [[ $NET_PROFILER ]]; then
+        build_cmd_str="${build_cmd_str} NET_PROFILER=1"
     fi
     if [[ $IGNORE_FAIL ]]; then
         build_cmd_str="${build_cmd_str} -i"

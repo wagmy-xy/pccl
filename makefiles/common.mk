@@ -55,6 +55,7 @@ KEEP ?= 0
 DEBUG ?= 0
 TRACE ?= 0
 PROFAPI ?= 0
+NET_PROFILER ?= 0
 HGTX ?= 1
 KERNEL_LOOPBACK ?= 0
 NO_EXTRA_WARP ?= 0
@@ -161,6 +162,10 @@ endif
 
 ifeq ($(NET_BYPASS), 1)
   CXXFLAGS  += -DNET_BYPASS
+endif
+
+ifneq ($(NET_PROFILER), 0)
+  CXXFLAGS += -DNCCL_ENABLE_NET_PROFILING=1
 endif
 
 ifeq ($(LOAD_BYPASS), 1)

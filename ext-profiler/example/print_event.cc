@@ -7,6 +7,7 @@
  *************************************************************************/
 
 #include <stdio.h>
+#include <algorithm>
 #include "err.h"
 #include "profiler.h"
 #include "event.h"
@@ -421,7 +422,7 @@ void printEvent(FILE* fh, void* handle) {
   } else if (type == ncclProfileProxyStep) {
     struct proxyStep* p = (struct proxyStep *)handle;
     printProxyStepEventHeader(fh, p);
-    for (int q = 0; q < p->nNetEvents; q++) {
+    for (int q = 0; q < std::min(p->nNetEvents, MAX_EVENTS_PER_REQ); q++) {
       printNetPluginEvent(fh, &p->net[q]);
     }
     printProxyStepEventTrailer(fh, p);

@@ -667,11 +667,14 @@ bool ncclProfilerPluginLoaded(void) {
 }
 
 ncclResult_t ncclProfilerCallback(void** eHandle, int type, void* pHandle, int64_t pluginId, void* extData) {
+  if (eHandle == nullptr) return ncclInvalidArgument;
+  if (type == ncclProfilerNetEventStart) *eHandle = nullptr;
   if (__builtin_expect(ncclProfiler != NULL, 0)) {
     if (type == ncclProfilerNetEventStart) { // start
+      if (pHandle == nullptr) return ncclSuccess;
       struct ncclProxyEventHandle* p = (struct ncclProxyEventHandle*)pHandle;
       struct ncclProxySubArgs* sub = p->subArgPtr;
-      if (sub->eActivationMask & ncclProfileNetPlugin) {
+      if (sub && (sub->eActivationMask & ncclProfileNetPlugin)) {
         ncclProfilerEventDescr_t eDescr = { 0 };
         eDescr.type = ncclProfileNetPlugin;
         eDescr.parentObj = p->stepEventHandle;
@@ -681,16 +684,20 @@ ncclResult_t ncclProfilerCallback(void** eHandle, int type, void* pHandle, int64
         ncclProfiler->startEvent(sub->profilerContext, eHandle, &eDescr);
       }
     } else if (type == ncclProfilerNetEventStop) { // stop
-      ncclProfiler->stopEvent(*eHandle);
+      if (*eHandle) ncclProfiler->stopEvent(*eHandle);
+      *eHandle = nullptr;
     } else if (type == ncclProfilerNetEventUpdate) { // update
+      if (*eHandle == nullptr) return ncclSuccess;
       ncclProfilerEventStateArgs_t args = { };
       args.netPlugin.data = extData;
       ncclProfiler->recordEventState(*eHandle, ncclProfilerNetPluginUpdate, &args);
     } else { // update and stop
+      if (*eHandle == nullptr) return ncclSuccess;
       ncclProfilerEventStateArgs_t args = { };
       args.netPlugin.data = extData;
       ncclProfiler->recordEventState(*eHandle, ncclProfilerNetPluginUpdate, &args);
       ncclProfiler->stopEvent(*eHandle);
+      *eHandle = nullptr;
     }
   }
   return ncclSuccess;
