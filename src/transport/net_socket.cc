@@ -114,8 +114,10 @@ ncclResult_t ncclNetSocketGetProperties(int dev, ncclNetProperties_t* props) {
 #define MAX_SOCKETS 64
 #define MAX_THREADS 16
 #define MAX_REQUESTS NCCL_NET_MAX_REQUESTS
-#define MIN_CHUNKSIZE (64*1024)
+#define SOCKET_CTRL_SIZE ((int)sizeof(int))
 
+NCCL_PARAM(SocketInlineSize, "SOCKET_INLINE", /*128 B=*/1 << 7);
+NCCL_PARAM(SocketMinTaskSize, "SOCKET_MIN_TASKSIZE", /*64 KiB=*/1 << 16);
 NCCL_PARAM(SocketNsocksPerThread, "NSOCKS_PERTHREAD", -2);
 NCCL_PARAM(SocketNthreads, "SOCKET_NTHREADS", -2);
 
@@ -156,6 +158,7 @@ struct ncclNetSocketRequest {
   int op;
   void* data;
   int size;
+  void* inlineData;
   struct ncclSocket* ctrlSock;
   int offset;
   int used;
@@ -194,10 +197,27 @@ struct ncclNetSocketComm {
   int nSocks;
   int nThreads;
   int nextSock;
+  int inlineSize;
+  int minTaskSize;
+  void* inlineData;
   struct ncclNetSocketRequest requests[MAX_REQUESTS];
   pthread_t helperThread[MAX_THREADS];
   struct ncclNetSocketThreadResources threadResources[MAX_THREADS];
 };
+
+static ncclResult_t ncclNetSocketInitInlineData(struct ncclNetSocketComm* comm) {
+  int64_t inlineSize = ncclParamSocketInlineSize();
+  int64_t minTaskSize = ncclParamSocketMinTaskSize();
+  if (inlineSize < 0 || inlineSize > INT_MAX - SOCKET_CTRL_SIZE || minTaskSize < 0 || minTaskSize > INT_MAX) {
+    ERROR("NET/Socket : invalid PCCL_SOCKET_INLINE or PCCL_SOCKET_MIN_TASKSIZE");
+    return ncclInvalidArgument;
+  }
+  // Keep the buffer stride and task partitioning fixed for the lifetime of this connection.
+  comm->inlineSize = (int)inlineSize;
+  comm->minTaskSize = (int)minTaskSize;
+  NCCLCHECK(ncclCalloc(&comm->inlineData, MAX_REQUESTS * (SOCKET_CTRL_SIZE + (size_t)comm->inlineSize)));
+  return ncclSuccess;
+}
 
 void* persistentSocketThread(void *args_) {
   struct ncclNetSocketThreadResources* resource = (struct ncclNetSocketThreadResources*)args_;
@@ -363,6 +383,7 @@ socket_send:
     NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, sock, &i, sizeof(uint8_t), &done), res, fail);
     if (done == 0) return ncclSuccess;
   }
+  NCCLCHECKGOTO(ncclNetSocketInitInlineData(comm), res, fail);
   *sendComm = comm;
 exit:
   return res;
@@ -372,6 +393,7 @@ fail:
     for (int i=0; i<comm->nSocks; i++) {
       ncclSocketClose(&comm->socks[i]);
     }
+    NCCLCHECK(ncclFree(comm->inlineData));
     NCCLCHECK(ncclFree(comm));
   }
   *sendComm = NULL;
@@ -421,6 +443,7 @@ socket_recv:
     else memcpy(rComm->socks+sendSockIdx, sock, sizeof(struct ncclSocket));
     NCCLCHECKGOTO(ncclFree(sock), res, fail);
   }
+  NCCLCHECKGOTO(ncclNetSocketInitInlineData(rComm), res, fail);
   *recvComm = rComm;
 
   /* reset lComm state */
@@ -436,6 +459,7 @@ fail:
     for (int i=0; i<rComm->nSocks; i++) {
       ncclSocketClose(&rComm->socks[i]);
     }
+    NCCLCHECK(ncclFree(rComm->inlineData));
     NCCLCHECK(ncclFree(rComm));
   }
   ncclFree(sock);
@@ -450,7 +474,9 @@ ncclResult_t ncclNetSocketGetRequest(struct ncclNetSocketComm* comm, int op, voi
       r->op = op;
       r->data = data;
       r->size = size;
+      r->inlineData = (uint8_t*)comm->inlineData + i * (SOCKET_CTRL_SIZE + (size_t)comm->inlineSize);
       r->ctrlSock = &comm->ctrlSock;
+      r->offset = 0;
       r->used = 1;
       r->comm = comm;
       r->nSubs = 0;
@@ -501,6 +527,11 @@ ncclResult_t ncclNetSocketGetTask(struct ncclNetSocketComm* comm, int op, void* 
   return ncclInternalError;
 }
 
+// Inline complete messages only, so larger transfers avoid an extra payload copy.
+static int ncclNetSocketInlineSize(struct ncclNetSocketRequest* r) {
+  return r->size <= r->comm->inlineSize ? r->size : 0;
+}
+
 ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
   *done = 0;
   struct ncclNetSocketRequest *r = (struct ncclNetSocketRequest*)request;
@@ -508,34 +539,51 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
     ERROR("NET/Socket : test called with NULL request");
     return ncclInternalError;
   }
-  if (r->used == 1) { /* try to send/recv size */
-    int data = r->size;
-    int offset = 0;
-    NCCLCHECK(ncclSocketProgress(r->op, r->ctrlSock, &data, sizeof(int), &offset));
-
-    if (offset == 0) return ncclSuccess; /* Not ready -- retry later */
-
-    // Not sure we could ever receive less than 4 bytes, but just in case ...
-    if (offset < sizeof(int)) NCCLCHECK(ncclSocketWait(r->op, r->ctrlSock, &data, sizeof(int), &offset));
-
-    // Check size is less or equal to the size provided by the user
-    if (r->op == NCCL_SOCKET_RECV && data > r->size) {
-      char line[SOCKET_NAME_MAXLEN+1];
-      union ncclSocketAddress addr;
-      ncclSocketGetAddr(r->ctrlSock, &addr);
-      ERROR("NET/Socket : peer %s message truncated : receiving %d bytes instead of %d. If you believe your socket network is in healthy state, \
-          there may be a mismatch in collective sizes or environment settings (e.g. PCCL_PROTO, PCCL_ALGO) between ranks",
-          ncclSocketToString(&addr, line), data, r->size);
-      return ncclInvalidUsage;
+  if (r->used == 1) { /* try to send/recv size and inline data */
+    // Keep the entire control-message offset across polls, including gaps between header and payload.
+    int inlineSize;
+    if (r->op == NCCL_SOCKET_SEND) {
+      inlineSize = ncclNetSocketInlineSize(r);
+      if (r->offset == 0) {
+        memcpy(r->inlineData, &r->size, SOCKET_CTRL_SIZE);
+        if (inlineSize > 0) memcpy((char*)r->inlineData + SOCKET_CTRL_SIZE, r->data, inlineSize);
+      }
+      int msgSize = SOCKET_CTRL_SIZE + inlineSize;
+      NCCLCHECK(ncclSocketProgress(r->op, r->ctrlSock, r->inlineData, msgSize, &r->offset));
+      if (r->offset < msgSize) return ncclSuccess;
+    } else {
+      // Receive only the header until the sender's actual size is known.
+      if (r->offset < SOCKET_CTRL_SIZE) {
+        NCCLCHECK(ncclSocketProgress(r->op, r->ctrlSock, r->inlineData, SOCKET_CTRL_SIZE, &r->offset));
+        if (r->offset < SOCKET_CTRL_SIZE) return ncclSuccess;
+        int senderSize;
+        memcpy(&senderSize, r->inlineData, SOCKET_CTRL_SIZE);
+        if (senderSize < 0 || senderSize > r->size) {
+          char line[SOCKET_NAME_MAXLEN+1];
+          union ncclSocketAddress addr;
+          NCCLCHECK(ncclSocketGetAddr(r->ctrlSock, &addr));
+          ERROR("NET/Socket : peer %s message truncated or invalid : receiving %d bytes instead of %d. "
+                "Check collective sizes and environment settings (e.g. PCCL_PROTO, PCCL_ALGO) between ranks",
+                ncclSocketToString(&addr, line), senderSize, r->size);
+          return ncclInvalidUsage;
+        }
+        r->size = senderSize;
+      }
+      inlineSize = ncclNetSocketInlineSize(r);
+      int offset = r->offset - SOCKET_CTRL_SIZE;
+      if (offset < inlineSize) {
+        NCCLCHECK(ncclSocketProgress(r->op, r->ctrlSock, r->data, inlineSize, &offset));
+        r->offset = SOCKET_CTRL_SIZE + offset;
+        if (offset < inlineSize) return ncclSuccess;
+      }
     }
-    r->size = data;
-    r->offset = 0;
-    r->used = 2; // done exchanging size
-    // divide into subtasks
-    int chunkOffset = 0, i = 0;
+    r->used = 2;
+    r->offset = inlineSize;
+    int chunkOffset = r->offset, i = 0;
     if (r->comm->nSocks > 0) {
-      // each request can be divided up to nSocks tasks
-      int taskSize = std::max(MIN_CHUNKSIZE, DIVUP(r->size, r->comm->nSocks));
+      // Each request can be divided into at most nSocks tasks, excluding inline data.
+      int remaining = r->size - r->offset;
+      int taskSize = std::max(r->comm->minTaskSize, remaining / r->comm->nSocks + (remaining % r->comm->nSocks != 0));
       while (chunkOffset < r->size) {
         int chunkSize = std::min(taskSize, r->size-chunkOffset);
         NCCLCHECK(ncclNetSocketGetTask(r->comm, r->op, (char*)(r->data)+chunkOffset, chunkSize, r->tasks+i++));
@@ -631,6 +679,7 @@ ncclResult_t ncclNetSocketClose(void* opaqueComm) {
       NCCLCHECK(ncclSocketReady(&comm->socks[i], &ready));
       if (ready) NCCLCHECK(ncclSocketClose(&comm->socks[i]));
     }
+    NCCLCHECK(ncclFree(comm->inlineData));
     NCCLCHECK(ncclFree(comm));
   }
   return ncclSuccess;
